@@ -1,0 +1,5 @@
+# dsh-pin-running —— DSH bundle patch
+# 桌面 profile 由 Electron 管理，安装见 README（手动 junction + package.json 条目）。
+- insert:
+    - id: pin-running
+      name: dsh-pin-running

@@ -1,0 +1,58 @@
+{
+  "name": "dsh-pin-running",
+  "version": "0.1.0",
+  "description": "DSH 插件：运行中的任务自动进入侧栏独立置顶区，保留原文件夹分组；运行中闪烁、完成后常绿，点开后切换任务才移除。",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check index.js && node --check client.js"
+  },
+  "engines": {
+    "dsh": ">=0.2.0",
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "author": "c66-m",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sidebar",
+    "pinned",
+    "sessions"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/c66-m/dsh-pin-running.git"
+  },
+  "homepage": "https://github.com/c66-m/dsh-pin-running#readme",
+  "bugs": {
+    "url": "https://github.com/c66-m/dsh-pin-running/issues"
+  }
+}
