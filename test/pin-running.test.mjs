@@ -15,7 +15,7 @@ globalThis.window = {
 }
 new Function('window', source)(globalThis.window)
 
-const { buildPinnedRows, relativeTime, pruneViewedCompleted } = exported._test
+const { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked } = exported._test
 
 test('buildPinnedRows lists tracked sessions, completed ones stay until consumed', () => {
   const now = 1000 * 60 * 10
@@ -87,4 +87,23 @@ test('apply never calls native pin/unpin', () => {
   const ctx = { get: (name) => services[name], effect: (fn) => fn() }
   exported.apply(ctx)
   assert.equal(touched, false)
+})
+
+test('pruneStaleTracked drops archived, missing, blank and subagent ids', () => {
+  const tracked = new Set(['gone', 'archived', 'blank', 'subagent', 'run', 'done'])
+  const viewed = new Set(['gone', 'archived', 'run'])
+  const list = {
+    ids: ['archived', 'blank', 'subagent', 'run', 'done'],
+    byId: {
+      archived: { id: 'archived', archived: true },
+      blank: { id: 'blank', blank: true },
+      subagent: { id: 'subagent', origin: 'subagent' },
+      run: { id: 'run', running: true },
+      done: { id: 'done', running: false },
+    },
+  }
+  assert.equal(pruneStaleTracked(tracked, viewed, list), true)
+  assert.deepEqual([...tracked].sort(), ['done', 'run'])
+  assert.deepEqual([...viewed].sort(), ['run'])
+  assert.equal(pruneStaleTracked(tracked, viewed, list), false)
 })

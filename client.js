@@ -78,6 +78,25 @@ window.__ModuleLoader__.load({
       return changed
     }
 
+    /**
+     * 清掉已不在列表里的 tracked 项：被归档、被删、变空白或变成 subagent 的
+     * 会话不再进置顶区，也不应继续占着 localStorage。只在列表 phase=ready
+     * 时调用，避免刷新间隙误删。
+     */
+    function pruneStaleTracked(tracked, viewed, list) {
+      const byId = (list && list.byId) || {}
+      let changed = false
+      for (const id of [...tracked]) {
+        const session = byId[id]
+        if (!session || session.archived || session.blank || session.origin === 'subagent') {
+          tracked.delete(id)
+          viewed.delete(id)
+          changed = true
+        }
+      }
+      return changed
+    }
+
     /** 相对时间，够用即可；原生行也是分钟/小时/天。 */
     function relativeTime(updatedAt, now) {
       const stamp = Number(updatedAt) || 0
@@ -141,6 +160,7 @@ window.__ModuleLoader__.load({
         .dsh-pin-running-dot[data-live="true"] { animation: dsh-pin-running-pulse 1.4s ease-in-out infinite; }
         .dsh-pin-running-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .dsh-pin-running-time { flex: none; font-size: 11px; opacity: .5; font-variant-numeric: tabular-nums; }
+        .dsh-pin-running-notice { padding: 4px 8px 6px; font-size: 11px; opacity: .6; }
         @keyframes dsh-pin-running-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
       `
       document.head.appendChild(style)
@@ -173,6 +193,7 @@ window.__ModuleLoader__.load({
       let tracked = loadTracked()
       const viewed = loadViewed()
       let currentId = localStorage.getItem(CURRENT_KEY) || ''
+      let mountWarned = false
 
       installStyle()
       const area = document.createElement('div')
@@ -181,7 +202,14 @@ window.__ModuleLoader__.load({
 
       const ensureMounted = () => {
         const mount = findMount()
-        if (!mount) return false
+        if (!mount) {
+          if (!mountWarned) {
+            mountWarned = true
+            console.warn(NAME, 'sidebar mount not found, pinned area hidden; DSH sidebar structure may have changed')
+          }
+          return false
+        }
+        mountWarned = false
         const placed =
           area.parentElement === mount.parent &&
           (mount.position === 'first'
@@ -196,6 +224,14 @@ window.__ModuleLoader__.load({
         return true
       }
 
+      const showNotice = (message) => {
+        const note = document.createElement('div')
+        note.className = 'dsh-pin-running-notice'
+        note.textContent = message
+        area.appendChild(note)
+        setTimeout(() => note.remove(), 3000)
+      }
+
       const open = (id) => {
         const list = sessions.list.getSnapshot()
         if (list.phase === 'ready' && list.byId[id]) {
@@ -204,8 +240,16 @@ window.__ModuleLoader__.load({
         }
         Promise.resolve(sessions.refresh()).then(() => {
           const next = sessions.list.getSnapshot()
-          if (next.phase === 'ready' && next.byId[id]) uiWorkspace.openSession(id)
-        }).catch((error) => console.warn(NAME, 'open session failed', id, error))
+          if (next.phase === 'ready' && next.byId[id]) {
+            uiWorkspace.openSession(id)
+          } else {
+            console.warn(NAME, 'open session failed, session no longer in list', id)
+            showNotice('该会话已不在列表中')
+          }
+        }).catch((error) => {
+          console.warn(NAME, 'open session failed', id, error)
+          showNotice('打开会话失败，请重试')
+        })
       }
 
       const render = () => {
@@ -218,6 +262,7 @@ window.__ModuleLoader__.load({
         }
         const statusMap = statuses ? statuses.getSnapshot() : undefined
         let changed = false
+        if (pruneStaleTracked(tracked, viewed, list)) changed = true
         for (const id of list.ids) {
           const session = list.byId[id]
           if (!session || session.archived || session.blank || session.origin === 'subagent') continue
@@ -226,7 +271,10 @@ window.__ModuleLoader__.load({
             changed = true
           }
         }
-        if (changed) saveTracked(tracked)
+        if (changed) {
+          saveTracked(tracked)
+          saveViewed(viewed)
+        }
 
         const rows = buildPinnedRows(list, registry, currentId, Date.now(), tracked, statusMap)
         area.hidden = rows.length === 0
@@ -357,7 +405,10 @@ window.__ModuleLoader__.load({
         if (entry) {
           try {
             const store = entry.store.create()
-            const actions = store && (store.actions || (store.create && store.create().actions))
+            // store 有两种形态：直接带 actions，或要再 create 一次才拿到 actions。
+            // 短路保证第二种 create 只在第一种不存在时调用一次。
+            const fallback = store && !store.actions && typeof store.create === 'function' ? store.create() : null
+            const actions = (store && store.actions) || (fallback && fallback.actions)
             if (actions && typeof actions.setGroupBy === 'function') {
               actions.setGroupBy('workspace')
               localStorage.setItem(GROUP_FLAG, '1')
@@ -384,6 +435,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    return { inject, apply, _test: { buildPinnedRows, relativeTime, pruneViewedCompleted } }
+    return { inject, apply, _test: { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked } }
   },
 })
