@@ -228,6 +228,9 @@ window.__ModuleLoader__.load({
         const note = document.createElement('div')
         note.className = 'dsh-pin-running-notice'
         note.textContent = message
+        // 点击处理会先 render()：会话已消失时 render 会把置顶区藏起来，
+        // 提示必须先把区打开，否则写进了隐藏的区里用户看不到。
+        area.hidden = false
         area.appendChild(note)
         setTimeout(() => note.remove(), 3000)
       }
