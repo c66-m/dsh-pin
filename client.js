@@ -2,8 +2,10 @@
  * dsh-pin-running —— 浏览器半端
  * ============================================================================
  * 在侧栏「工作区」标题下渲染一个独立的置顶区，不按目录分组，也不把会话从
- * 原文件夹移走。运行中的会话自动进入；跑完继续留着（绿点常绿），点开查看
- * 后移除；点击一律调用 uiWorkspace.openSession，由 DSH 回到原 workspace/cwd。
+ * 原文件夹移走。运行中的会话自动进入；跑完/中断/失败继续留着，已完成项点开
+ * 后切到别的任务才移除；置顶栏收起时只藏运行中的多余条目，完成/中断/失败
+ * 条目始终完整显示；点击一律调用
+ * uiWorkspace.openSession，由 DSH 回到原 workspace/cwd。
  * ============================================================================
  */
 window.__ModuleLoader__.load({
@@ -51,7 +53,7 @@ window.__ModuleLoader__.load({
      * 切到别的任务时才消费：已完成、且点开看过的项从置顶区移除。
      * keepId 是刚切过去的任务，不能在同一拍被清掉。
      */
-    function pruneViewedCompleted(tracked, viewed, isRunningById, keepId) {
+    function pruneViewedCompleted(tracked, viewed, isRunningById, keepId, isInterruptedById) {
       let changed = false
       for (const id of [...viewed]) {
         if (id === keepId) continue
@@ -60,7 +62,8 @@ window.__ModuleLoader__.load({
           changed = true
           continue
         }
-        if (!isRunningById(id)) {
+        // 失败/中断的任务要一直留在置顶区，不能像已完成项那样看过就消费。
+        if (!isRunningById(id) && !(isInterruptedById && isInterruptedById(id))) {
           tracked.delete(id)
           viewed.delete(id)
           changed = true
@@ -86,6 +89,21 @@ window.__ModuleLoader__.load({
         }
       }
       return changed
+    }
+
+    /** 收起时只藏运行中的多余行；完成/中断行不受收起影响，始终完整显示。 */
+    function visiblePinnedRows(rows, expanded) {
+      if (expanded) return rows
+      const firstRunning = rows.findIndex((row) => row.state === 'running')
+      return rows.filter((row, index) => row.state !== 'running' || index === firstRunning)
+    }
+
+    /** 运行中的任务刚结束（完成/失败/中断）时强制展开，别让完成状态被收起遮住。 */
+    function shouldAutoExpand(previousStates, rows) {
+      for (const row of rows) {
+        if (previousStates.get(row.id) === 'running' && row.state !== 'running') return true
+      }
+      return false
     }
 
     /** 相对时间，够用即可；原生行也是分钟/小时/天。 */
@@ -119,8 +137,8 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 生成置顶区行：trackedIds 是插件记住的任务。完成的也列出（常绿），
-     * 中断的列在运行中之后、完成之前（黄点常亮）；原文件夹里的行保持不动。
+     * 生成置顶区行：trackedIds 是插件记住的任务。完成的任务排最上面（常绿），
+     * 之后是运行中，最后是中断（黄点常亮）；原文件夹里的行保持不动。
      */
     function buildPinnedRows(list, registry, currentId, now, trackedIds, statuses, interruptedIds) {
       const ids = Array.isArray(list && list.ids) ? list.ids : []
@@ -152,7 +170,7 @@ window.__ModuleLoader__.load({
           time: relativeTime(session.updatedAt, now),
         })
       }
-      const rank = { running: 0, interrupted: 1, completed: 2 }
+      const rank = { completed: 0, running: 1, interrupted: 2 }
       rows.sort((a, b) => rank[a.state] - rank[b.state] || b.updatedAt - a.updatedAt)
       return rows
     }
@@ -165,8 +183,12 @@ window.__ModuleLoader__.load({
       style.textContent = `
         .dsh-pin-running-area { display: flex; flex-direction: column; gap: 1px; padding: 0 8px 6px; flex: 0 0 auto; max-height: min(40vh, 320px); overflow-y: auto; }
         .dsh-pin-running-area[hidden] { display: none; }
-        .dsh-pin-running-head { display: flex; align-items: center; gap: 6px; padding: 6px 6px 2px; font-size: 11px; letter-spacing: .08em; opacity: .55; }
+        .dsh-pin-running-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 11px; letter-spacing: .08em; text-align: left; cursor: pointer; opacity: .55; }
+        .dsh-pin-running-head:hover { background: color-mix(in srgb, currentColor 8%, transparent); opacity: .8; }
+        .dsh-pin-running-head[data-expanded="true"] { opacity: .7; }
         .dsh-pin-running-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+        .dsh-pin-running-chevron { font-size: 10px; transition: transform .15s ease; }
+        .dsh-pin-running-head[data-expanded="true"] .dsh-pin-running-chevron { transform: rotate(180deg); }
         .dsh-pin-running-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px 8px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
         .dsh-pin-running-row:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
         .dsh-pin-running-row[data-current="true"] { background: color-mix(in srgb, currentColor 14%, transparent); }
@@ -208,6 +230,8 @@ window.__ModuleLoader__.load({
       let tracked = loadTracked()
       const viewed = loadViewed()
       let currentId = localStorage.getItem(CURRENT_KEY) || ''
+      let expanded = false
+      const previousStates = new Map()
       let mountWarned = false
 
       installStyle()
@@ -279,6 +303,8 @@ window.__ModuleLoader__.load({
         const statusMap = statuses ? statuses.getSnapshot() : undefined
         return isRunning(list && list.byId ? list.byId[id] : undefined, statusMap && statusMap.get(id))
       }
+
+      const isInterruptedNow = (id) => interrupted.has(id)
 
       const setInterrupted = (id, on) => {
         if (!tracked.has(id)) return
@@ -360,6 +386,8 @@ window.__ModuleLoader__.load({
         if (interruptedChanged) saveInterrupted(interrupted)
 
         const rows = buildPinnedRows(list, registry, currentId, Date.now(), tracked, statusMap, interrupted)
+        if (shouldAutoExpand(previousStates, rows)) expanded = true
+        for (const row of rows) previousStates.set(row.id, row.state)
         const visible = new Set(rows.map((row) => row.id))
         for (const row of rows) watch(row.id)
         for (const id of [...watchers.keys()]) {
@@ -368,17 +396,32 @@ window.__ModuleLoader__.load({
         area.hidden = rows.length === 0
         area.replaceChildren()
 
-        const head = document.createElement('div')
+        const collapsedRows = visiblePinnedRows(rows, false)
+        const canToggle = collapsedRows.length < rows.length
+        const head = document.createElement('button')
+        head.type = 'button'
         head.className = 'dsh-pin-running-head'
+        head.dataset.expanded = String(expanded)
+        head.title = canToggle ? (expanded ? '收起置顶' : '展开置顶') : ''
         const label = document.createElement('span')
         label.textContent = '置顶'
         const count = document.createElement('span')
         count.className = 'dsh-pin-running-count'
-        count.textContent = String(rows.length)
+        count.textContent = canToggle && !expanded ? collapsedRows.length + '/' + rows.length : String(rows.length)
         head.append(label, count)
+        if (canToggle) {
+          const chevron = document.createElement('span')
+          chevron.className = 'dsh-pin-running-chevron'
+          chevron.textContent = '▾'
+          head.append(chevron)
+          head.addEventListener('click', () => {
+            expanded = !expanded
+            render()
+          })
+        }
         area.appendChild(head)
 
-        for (const row of rows) {
+        for (const row of visiblePinnedRows(rows, expanded)) {
           const button = document.createElement('button')
           button.type = 'button'
           button.className = 'dsh-pin-running-row'
@@ -399,14 +442,14 @@ window.__ModuleLoader__.load({
             const statusNow = statuses ? statuses.getSnapshot() : undefined
             const runningById = (id) => isRunning(listNow.byId[id], statusNow && statusNow.get(id))
             // 切到别的任务时，才把「已完成且点开看过」的旧项清掉。
-            if (currentId && currentId !== row.id && pruneViewedCompleted(tracked, viewed, runningById, row.id)) {
+            if (currentId && currentId !== row.id && pruneViewedCompleted(tracked, viewed, runningById, row.id, isInterruptedNow)) {
               saveTracked(tracked)
               saveViewed(viewed)
             }
             currentId = row.id
             localStorage.setItem(CURRENT_KEY, row.id)
-            // 运行中的点击只打开，绝不删；完成的先留壳，等下次切换再清。
-            if (!row.running) {
+            // 运行中的点击只打开；失败/中断的要一直停留；完成的先留壳，等下次切换再清。
+            if (!row.running && !row.interrupted) {
               viewed.add(row.id)
               saveViewed(viewed)
             }
@@ -440,7 +483,7 @@ window.__ModuleLoader__.load({
         const statusMap = statuses ? statuses.getSnapshot() : undefined
         if (list && list.phase === 'ready') {
           const runningById = (id) => isRunning(list.byId[id], statusMap && statusMap.get(id))
-          if (pruneViewedCompleted(tracked, viewed, runningById, stored)) {
+          if (pruneViewedCompleted(tracked, viewed, runningById, stored, isInterruptedNow)) {
             saveTracked(tracked)
             saveViewed(viewed)
           }
@@ -545,6 +588,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    return { inject, apply, _test: { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked, terminalStateFromEntries } }
+    return { inject, apply, _test: { buildPinnedRows, visiblePinnedRows, shouldAutoExpand, relativeTime, pruneViewedCompleted, pruneStaleTracked, terminalStateFromEntries } }
   },
 })
