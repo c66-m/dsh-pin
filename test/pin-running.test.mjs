@@ -15,7 +15,7 @@ globalThis.window = {
 }
 new Function('window', source)(globalThis.window)
 
-const { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked } = exported._test
+const { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked, terminalStateFromEntries } = exported._test
 
 test('buildPinnedRows lists tracked sessions, completed ones stay until consumed', () => {
   const now = 1000 * 60 * 10
@@ -53,6 +53,39 @@ test('buildPinnedRows trusts live status over stale summary running flag', () =>
   const done = buildPinnedRows(list, registry, '', 1000, new Set(['stale']), new Map([['stale', { running: false }]]))
   assert.equal(done.length, 1)
   assert.equal(done[0].running, false)
+})
+
+test('terminalStateFromEntries marks abnormal or unfinished turns as interrupted', () => {
+  const entry = (seq, type, data) => ({ event: { seq, type, data } })
+  assert.equal(terminalStateFromEntries([
+    entry(1, 'turn/start', {}),
+    entry(2, 'turn/end', { reason: { kind: 'completed' } }),
+  ]), 'completed')
+  assert.equal(terminalStateFromEntries([
+    entry(1, 'turn/start', {}),
+    entry(2, 'turn/end', { reason: { kind: 'interrupted' } }),
+  ]), 'interrupted')
+  assert.equal(terminalStateFromEntries([
+    entry(1, 'turn/start', {}),
+    entry(2, 'turn/end', { reason: { kind: 'error', error: { message: 'boom' } } }),
+  ]), 'interrupted')
+  assert.equal(terminalStateFromEntries([entry(1, 'turn/start', {})]), 'interrupted')
+})
+
+test('buildPinnedRows marks interrupted tasks with steady yellow state', () => {
+  const list = {
+    ids: ['stopped', 'done', 'run'],
+    byId: {
+      stopped: { id: 'stopped', title: '中断', running: false, updatedAt: 300 },
+      done: { id: 'done', title: '完成', running: false, updatedAt: 200 },
+      run: { id: 'run', title: '运行', running: true, updatedAt: 100 },
+    },
+  }
+  const rows = buildPinnedRows(list, { archivedSessionIds: [], items: [] }, '', 1000, new Set(['stopped', 'done', 'run']), undefined, new Set(['stopped']))
+  assert.deepEqual(rows.map((row) => row.id), ['run', 'stopped', 'done'])
+  assert.equal(rows[1].state, 'interrupted')
+  assert.equal(rows[1].interrupted, true)
+  assert.equal(rows[2].state, 'completed')
 })
 
 test('completed viewed items are consumed only after switching to another task', () => {

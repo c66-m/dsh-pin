@@ -1,7 +1,7 @@
 {
   "name": "dsh-pin-running",
-  "version": "0.1.0",
-  "description": "DSH 插件：运行中的任务自动进入侧栏独立置顶区，保留原文件夹分组；运行中闪烁、完成后常绿，点开后切换任务才移除。",
+  "version": "0.1.1",
+  "description": "DSH 插件：运行中的任务自动进入侧栏独立置顶区，保留原文件夹分组；运行中绿点闪烁、中断常亮黄、完成后常绿，点开后切换任务才移除。",
   "license": "MIT",
   "type": "module",
   "main": "index.js",

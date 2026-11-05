@@ -14,6 +14,7 @@ window.__ModuleLoader__.load({
     const CURRENT_KEY = 'dsh.sessions.current'
     const STORE_KEY = 'dsh-pin-running.tasks.v1'
     const VIEWED_KEY = 'dsh-pin-running.viewed.v1'
+    const INTERRUPTED_KEY = 'dsh-pin-running.interrupted.v1'
 
     /** 运行状态以 uiSession.sessionStatus 为准，缺失时退回会话摘要。 */
     function isRunning(session, status) {
@@ -22,39 +23,29 @@ window.__ModuleLoader__.load({
       return session.running === true || (Number(session.runningSubagentCount) || 0) > 0
     }
 
-    function loadTracked() {
+    function loadIds(key) {
       try {
-        const value = JSON.parse(localStorage.getItem(STORE_KEY) || '[]')
+        const value = JSON.parse(localStorage.getItem(key) || '[]')
         return new Set(Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [])
       } catch {
         return new Set()
       }
     }
 
-    function saveTracked(ids) {
+    function saveIds(key, ids, label) {
       try {
-        localStorage.setItem(STORE_KEY, JSON.stringify([...ids]))
+        localStorage.setItem(key, JSON.stringify([...ids]))
       } catch (error) {
-        console.warn(NAME, 'save tasks failed', error)
+        console.warn(NAME, 'save ' + label + ' failed', error)
       }
     }
 
-    function loadViewed() {
-      try {
-        const value = JSON.parse(localStorage.getItem(VIEWED_KEY) || '[]')
-        return new Set(Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [])
-      } catch {
-        return new Set()
-      }
-    }
-
-    function saveViewed(ids) {
-      try {
-        localStorage.setItem(VIEWED_KEY, JSON.stringify([...ids]))
-      } catch (error) {
-        console.warn(NAME, 'save viewed failed', error)
-      }
-    }
+    const loadTracked = () => loadIds(STORE_KEY)
+    const loadViewed = () => loadIds(VIEWED_KEY)
+    const loadInterrupted = () => loadIds(INTERRUPTED_KEY)
+    const saveTracked = (ids) => saveIds(STORE_KEY, ids, 'tasks')
+    const saveViewed = (ids) => saveIds(VIEWED_KEY, ids, 'viewed')
+    const saveInterrupted = (ids) => saveIds(INTERRUPTED_KEY, ids, 'interrupted')
 
     /**
      * 切到别的任务时才消费：已完成、且点开看过的项从置顶区移除。
@@ -110,10 +101,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 生成置顶区行：trackedIds 是插件记住的任务。完成的也列出（常绿），
-     * 直到用户点开查看时移除；原文件夹里的行保持不动。
+     * 从会话事件里读最后一轮的状态：completed 以外（error/aborted/interrupted/
+     * max-tokens/blocked）或只有 turn/start 没有 turn/end，都算中断。
      */
-    function buildPinnedRows(list, registry, currentId, now, trackedIds, statuses) {
+    function terminalStateFromEntries(entries) {
+      let state
+      for (const entry of entries || []) {
+        const event = entry && entry.event
+        if (!event) continue
+        if (event.type === 'turn/start') state = 'interrupted'
+        else if (event.type === 'turn/end') {
+          const kind = event.data && event.data.reason && event.data.reason.kind
+          state = kind === 'completed' ? 'completed' : 'interrupted'
+        }
+      }
+      return state
+    }
+
+    /**
+     * 生成置顶区行：trackedIds 是插件记住的任务。完成的也列出（常绿），
+     * 中断的列在运行中之后、完成之前（黄点常亮）；原文件夹里的行保持不动。
+     */
+    function buildPinnedRows(list, registry, currentId, now, trackedIds, statuses, interruptedIds) {
       const ids = Array.isArray(list && list.ids) ? list.ids : []
       const byId = (list && list.byId) || {}
       const archived = new Set((registry && registry.archivedSessionIds) || [])
@@ -129,17 +138,22 @@ window.__ModuleLoader__.load({
         if (!session || !trackedIds.has(id) || archived.has(id) || session.archived) continue
         if (session.blank || session.origin === 'subagent') continue
         const workspace = workspaceOf.get(id)
+        const running = isRunning(session, statuses && statuses.get(id))
+        const interrupted = !running && Boolean(interruptedIds && interruptedIds.has(id))
         rows.push({
           id,
           title: (session.title && session.title.trim()) || '未命名会话',
-          running: isRunning(session, statuses && statuses.get(id)),
+          running,
+          interrupted,
+          state: running ? 'running' : interrupted ? 'interrupted' : 'completed',
           updatedAt: Number(session.updatedAt) || 0,
           path: (workspace && workspace.path) || session.cwd || '',
           current: id === currentId,
           time: relativeTime(session.updatedAt, now),
         })
       }
-      rows.sort((a, b) => Number(b.running) - Number(a.running) || b.updatedAt - a.updatedAt)
+      const rank = { running: 0, interrupted: 1, completed: 2 }
+      rows.sort((a, b) => rank[a.state] - rank[b.state] || b.updatedAt - a.updatedAt)
       return rows
     }
 
@@ -157,7 +171,8 @@ window.__ModuleLoader__.load({
         .dsh-pin-running-row:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
         .dsh-pin-running-row[data-current="true"] { background: color-mix(in srgb, currentColor 14%, transparent); }
         .dsh-pin-running-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: #2fbf71; box-shadow: 0 0 0 3px rgba(47, 191, 113, .16); }
-        .dsh-pin-running-dot[data-live="true"] { animation: dsh-pin-running-pulse 1.4s ease-in-out infinite; }
+        .dsh-pin-running-dot[data-state="running"] { animation: dsh-pin-running-pulse 1.4s ease-in-out infinite; }
+        .dsh-pin-running-dot[data-state="interrupted"] { background: #e0a400; box-shadow: 0 0 0 3px rgba(224, 164, 0, .22); }
         .dsh-pin-running-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .dsh-pin-running-time { flex: none; font-size: 11px; opacity: .5; font-variant-numeric: tabular-nums; }
         .dsh-pin-running-notice { padding: 4px 8px 6px; font-size: 11px; opacity: .6; }
@@ -255,6 +270,67 @@ window.__ModuleLoader__.load({
         })
       }
 
+      const interrupted = loadInterrupted()
+      const watchers = new Map()
+
+      /** 会话此刻是否仍在跑。运行中的行本来就显示绿点，不该判成「中断」。 */
+      const isRunningNow = (id) => {
+        const list = sessions.list.getSnapshot()
+        const statusMap = statuses ? statuses.getSnapshot() : undefined
+        return isRunning(list && list.byId ? list.byId[id] : undefined, statusMap && statusMap.get(id))
+      }
+
+      const setInterrupted = (id, on) => {
+        if (!tracked.has(id)) return
+        // 关键：运行中不落「中断」标记。否则 render() 里清标记、check() 里又置标记，
+        // 一来一回就是死循环（事件流越密圈转得越快，最终把渲染进程内存撑爆）。
+        if (on && isRunningNow(id)) return
+        if (on ? interrupted.has(id) : !interrupted.has(id)) return
+        if (on) interrupted.add(id)
+        else interrupted.delete(id)
+        saveInterrupted(interrupted)
+        scheduleRender()
+      }
+
+      const unwatch = (id) => {
+        const holder = watchers.get(id)
+        if (!holder) return
+        holder.cancelled = true
+        watchers.delete(id)
+        try { if (holder.unsubscribe) holder.unsubscribe() } catch {}
+        try { if (holder.ref && holder.ref.release) holder.ref.release() } catch {}
+      }
+
+      /** 把一个 tracked 会话的 turn 事件接进来，读最后一次 turn/end。 */
+      const watch = (id) => {
+        if (watchers.has(id)) return
+        let ref
+        try {
+          ref = sessions.retain(id, { source: 'pin-running' })
+        } catch (error) {
+          console.warn(NAME, 'retain session failed', id, error)
+          return
+        }
+        const holder = { ref, unsubscribe: null, cancelled: false }
+        watchers.set(id, holder)
+        Promise.resolve(ref.ready).then((binding) => {
+          if (holder.cancelled) return
+          const source = binding && binding.eventSource
+          if (!source || typeof source.getSnapshot !== 'function') return
+          const check = () => {
+            if (holder.cancelled) return
+            const state = terminalStateFromEntries(source.getSnapshot().entries)
+            if (state === 'interrupted') setInterrupted(id, true)
+            else if (state === 'completed') setInterrupted(id, false)
+          }
+          if (typeof source.subscribe === 'function') holder.unsubscribe = source.subscribe(check)
+          check()
+        }).catch((error) => {
+          console.warn(NAME, 'watch session failed', id, error)
+          unwatch(id)
+        })
+      }
+
       const render = () => {
         ensureMounted()
         const list = sessions.list.getSnapshot()
@@ -266,20 +342,29 @@ window.__ModuleLoader__.load({
         const statusMap = statuses ? statuses.getSnapshot() : undefined
         let changed = false
         if (pruneStaleTracked(tracked, viewed, list)) changed = true
+        let interruptedChanged = false
         for (const id of list.ids) {
           const session = list.byId[id]
           if (!session || session.archived || session.blank || session.origin === 'subagent') continue
-          if (isRunning(session, statusMap && statusMap.get(id)) && !tracked.has(id)) {
+          const running = isRunning(session, statusMap && statusMap.get(id))
+          if (running && !tracked.has(id)) {
             tracked.add(id)
             changed = true
           }
+          if (running && interrupted.delete(id)) interruptedChanged = true
         }
         if (changed) {
           saveTracked(tracked)
           saveViewed(viewed)
         }
+        if (interruptedChanged) saveInterrupted(interrupted)
 
-        const rows = buildPinnedRows(list, registry, currentId, Date.now(), tracked, statusMap)
+        const rows = buildPinnedRows(list, registry, currentId, Date.now(), tracked, statusMap, interrupted)
+        const visible = new Set(rows.map((row) => row.id))
+        for (const row of rows) watch(row.id)
+        for (const id of [...watchers.keys()]) {
+          if (!visible.has(id)) unwatch(id)
+        }
         area.hidden = rows.length === 0
         area.replaceChildren()
 
@@ -301,7 +386,7 @@ window.__ModuleLoader__.load({
           button.title = row.path || row.title
           const dot = document.createElement('span')
           dot.className = 'dsh-pin-running-dot'
-          dot.dataset.live = String(row.running)
+          dot.dataset.state = row.state
           const title = document.createElement('span')
           title.className = 'dsh-pin-running-title'
           title.textContent = row.title
@@ -332,6 +417,22 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 把同一批通知合并成一次渲染：订阅回调里不再直接 render()，
+       * 避免「渲染 → 订阅回调 → 渲染」的同步递归。
+       */
+      let scheduled = false
+      const scheduleRender = () => {
+        if (scheduled) return
+        scheduled = true
+        const flush = () => {
+          scheduled = false
+          render()
+        }
+        if (typeof setTimeout === 'function') setTimeout(flush, 16)
+        else flush()
+      }
+
       const syncCurrent = () => {
         const stored = localStorage.getItem(CURRENT_KEY) || ''
         if (!stored || stored === currentId) return false
@@ -348,9 +449,13 @@ window.__ModuleLoader__.load({
         return true
       }
 
-      const onSessions = sessions.list.subscribe(render)
-      const onWorkspaces = workspaces.list.subscribe(render)
-      const onStatuses = statuses ? statuses.subscribe(render) : () => {}
+      const onSessions = sessions.list.subscribe(scheduleRender)
+      const onWorkspaces = workspaces.list.subscribe(scheduleRender)
+      const onStatuses = statuses ? statuses.subscribe(scheduleRender) : () => {}
+      const remote = ctx.get('remote')
+      const offError = remote && typeof remote.$on === 'function'
+        ? remote.$on('api-session/error', (id) => setInterrupted(id, true))
+        : () => {}
       // 原生列表点走别的会话不会触发我们的订阅，轮询 localStorage 兜底。
       const timer = setInterval(() => {
         if (syncCurrent()) render()
@@ -374,6 +479,8 @@ window.__ModuleLoader__.load({
         onSessions()
         onWorkspaces()
         onStatuses()
+        offError()
+        for (const id of [...watchers.keys()]) unwatch(id)
         area.remove()
       }
     }
@@ -438,6 +545,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    return { inject, apply, _test: { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked } }
+    return { inject, apply, _test: { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked, terminalStateFromEntries } }
   },
 })
