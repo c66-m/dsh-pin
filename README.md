@@ -29,7 +29,7 @@ DSH 插件：把运行中的任务置顶到侧栏顶部的独立「置顶」区�
 先克隆仓库（路径按你的实际位置改）：
 
 ```powershell
-git clone https://github.com/c66-m/dsh-pin-running.git
+git clone https://github.com/c66-m/dsh-pin.git
 ```
 
 普通 profile：
@@ -61,6 +61,6 @@ dsh plugin --profile <name> add link:<本仓库绝对路径>
 npm pack
 ```
 
-生成 `dsh-pin-running-0.1.1.tgz`，方便离线携带分发。
+生成 `dsh-pin-running-0.1.2.tgz`，方便离线携带分发。
 
 卸载：删掉 package.json 里的依赖与 bundles 条目、删除 node_modules 下的 junction，重启。改坏时直接用备份的 `package.json.bak` 恢复。

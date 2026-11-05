@@ -49,10 +49,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/c66-m/dsh-pin-running.git"
+    "url": "git+https://github.com/c66-m/dsh-pin.git"
   },
-  "homepage": "https://github.com/c66-m/dsh-pin-running#readme",
+  "homepage": "https://github.com/c66-m/dsh-pin#readme",
   "bugs": {
-    "url": "https://github.com/c66-m/dsh-pin-running/issues"
+    "url": "https://github.com/c66-m/dsh-pin/issues"
   }
 }
