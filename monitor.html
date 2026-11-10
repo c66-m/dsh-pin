@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>任务监控</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #17181c;
+    --panel: #202127;
+    --line: rgba(255,255,255,.09);
+    --text: #e8e8ea;
+    --muted: #8f9098;
+    --green: #34c97b;
+    --yellow: #e0a400;
+    --blue: #6aa7ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.4 "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    user-select: none;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 42px;
+    padding: 0 10px 0 14px;
+    border-bottom: 1px solid var(--line);
+    -webkit-app-region: drag;
+  }
+  .brand { font-size: 12px; letter-spacing: .08em; opacity: .8; }
+  .count {
+    min-width: 20px; padding: 1px 6px; border-radius: 999px;
+    background: rgba(255,255,255,.08); color: var(--muted);
+    font-size: 11px; text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .spacer { flex: 1; }
+  header button {
+    width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px;
+    background: transparent; color: var(--muted); font: inherit; font-size: 15px;
+    cursor: pointer; -webkit-app-region: no-drag;
+  }
+  header button:hover { background: rgba(255,255,255,.09); color: var(--text); }
+  header button.active { color: var(--yellow); }
+  header button svg { width: 14px; height: 14px; display: block; margin: auto; }
+  main { flex: 1; overflow: auto; padding: 7px; }
+  .row {
+    display: flex; align-items: flex-start; gap: 9px; width: 100%;
+    padding: 9px 9px; margin: 1px 0; border: 0; border-radius: 9px;
+    background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  }
+  .row:hover { background: rgba(255,255,255,.07); }
+  .row.current { background: rgba(106,167,255,.1); }
+  .dot {
+    width: 7px; height: 7px; flex: none; margin-top: 5px; border-radius: 50%;
+    background: var(--green); box-shadow: 0 0 0 3px rgba(52,201,123,.14);
+  }
+  .row[data-state="running"] .dot { animation: pulse 1.4s ease-in-out infinite; }
+  .row[data-state="interrupted"] .dot { background: var(--yellow); box-shadow: 0 0 0 3px rgba(224,164,0,.18); }
+  .row[data-state="pending"] .dot { background: var(--yellow); box-shadow: 0 0 0 3px rgba(224,164,0,.18); }
+  .row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+  .row-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10.5px; }
+  .row[data-state="interrupted"] .row-detail, .row[data-state="pending"] .row-detail { color: var(--yellow); opacity: .9; }
+  .empty { padding: 28px 12px; color: var(--muted); text-align: center; font-size: 12px; }
+  footer {
+    display: flex; align-items: center; gap: 12px; height: 30px; padding: 0 14px;
+    border-top: 1px solid var(--line); color: var(--muted); font-size: 10.5px;
+  }
+  footer .spacer { flex: 1; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .38; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">任务监控</span>
+  <span class="count" id="count">0</span>
+  <span class="spacer"></span>
+  <button id="pin" class="active" title="取消置顶"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M8 3h8l-1 6 3 3v2H6v-2l3-3-1-6Z"/></svg></button>
+  <button id="close" title="关闭"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+</header>
+<main id="list"><div class="empty">正在读取任务…</div></main>
+<footer>
+  <span>● 运行中</span><span style="color:var(--yellow)">● 中断/失败</span><span style="color:var(--green)">● 已完成</span>
+  <span class="spacer"></span><span id="hint">点击任务跳转</span>
+</footer>
+<script>
+const list = document.getElementById('list')
+const count = document.getElementById('count')
+const pin = document.getElementById('pin')
+let topmost = true
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? { cache: 'no-store' } : {
+    method: 'POST', cache: 'no-store',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error('HTTP ' + res.status)
+  return res.json()
+}
+
+function makeRow(row) {
+  const button = document.createElement('button')
+  button.className = 'row' + (row.current ? ' current' : '')
+  button.dataset.state = row.pendingKind ? 'pending' : row.state
+  button.title = row.detail || row.title
+  const dot = document.createElement('span')
+  dot.className = 'dot'
+  const main = document.createElement('span')
+  main.className = 'row-main'
+  const title = document.createElement('span')
+  title.className = 'row-title'
+  title.textContent = row.title
+  const detail = document.createElement('span')
+  detail.className = 'row-detail'
+  const pendingLabel = row.pendingKind === 'question' ? '等待回答' : row.pendingKind === 'plan-review' ? '计划待审' : row.pendingKind === 'approval' ? '等待审批' : ''
+  const rawDetail = String(row.detail || '')
+  const fallbackDetail = rawDetail.includes('|') ? rawDetail.replace('|', ' · ') : ''
+  detail.textContent = row.pendingKind ? [pendingLabel, row.pendingText].filter(Boolean).join(' · ') : (fallbackDetail || rawDetail || (row.state === 'running' ? '运行中' : row.state === 'interrupted' ? '已中断' : '已完成'))
+  main.append(title, detail)
+  button.append(dot, main)
+  button.addEventListener('click', async () => {
+    try { await api('/dsh-pin-running/focus', { id: row.id }) } catch (error) { console.error(error) }
+  })
+  return button
+}
+
+async function refresh() {
+  try {
+    const data = await api('/dsh-pin-running/tasks')
+    const rows = Array.isArray(data.rows) ? data.rows : []
+    count.textContent = String(rows.length)
+    list.replaceChildren()
+    if (!rows.length) {
+      const empty = document.createElement('div')
+      empty.className = 'empty'
+      empty.textContent = '暂无任务'
+      list.appendChild(empty)
+      return
+    }
+    for (const row of rows) list.appendChild(makeRow(row))
+  } catch (error) {
+    list.replaceChildren()
+    const empty = document.createElement('div')
+    empty.className = 'empty'
+    empty.textContent = '无法连接 DSH 宿主：' + error.message
+    list.appendChild(empty)
+  }
+}
+
+pin.addEventListener('click', async () => {
+  topmost = !topmost
+  pin.classList.toggle('active', topmost)
+  pin.title = topmost ? '取消置顶' : '置顶窗口'
+  try { await api('/dsh-pin-running/window', { action: 'topmost', on: topmost }) } catch (error) { console.error(error) }
+})
+
+document.getElementById('close').addEventListener('click', async () => {
+  try { await api('/dsh-pin-running/window', { action: 'close' }) } catch {}
+  window.close()
+})
+
+api('/dsh-pin-running/window').then((state) => {
+  topmost = state.topmost !== false
+  pin.classList.toggle('active', topmost)
+  pin.title = topmost ? '取消置顶' : '置顶窗口'
+}).catch(() => {})
+
+refresh()
+setInterval(refresh, 900)
+</script>
+</body>
+</html>

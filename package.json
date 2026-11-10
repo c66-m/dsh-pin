@@ -1,7 +1,7 @@
 {
   "name": "dsh-pin-running",
-  "version": "0.1.2",
-  "description": "DSH 插件：运行中的任务自动进入侧栏独立置顶区，保留原文件夹分组；完成项排置顶最上面，置顶区默认收起运行中的多余条目、点标题展开；完成/中断/失败条目不受收起影响始终完整显示；运行中绿点闪烁、中断/失败常亮黄、完成后常绿，失败项常驻，已完成项点开后切换任务才移除。",
+  "version": "0.2.5",
+  "description": "DSH 插件：运行中的任务自动进入侧栏独立置顶区，保留原文件夹分组，每个项目里的任务按最近对话时间从近到远排序；完成项排置顶最上面，点标题可整区收起/展开；运行中绿点闪烁、自动中断/失败常亮黄、完成和用户手动停止常绿；已完成、中断/失败项均可点 × 移除置顶显示；另带独立任务监控小窗，默认极小、可展开、可置顶；任务行只显示任务进行中/任务完成/任务中断状态，需要选择时显示等待回答/等待审批/计划待审并弹出提示。",
   "license": "MIT",
   "type": "module",
   "main": "index.js",
@@ -15,7 +15,10 @@
     "client.js",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "monitor.html",
+    "monitor.ps1",
+    "monitor-window.ps1"
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
@@ -49,10 +52,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/c66-m/dsh-pin.git"
+    "url": "git+https://github.com/c66-m/dsh-pin-running.git"
   },
-  "homepage": "https://github.com/c66-m/dsh-pin#readme",
+  "homepage": "https://github.com/c66-m/dsh-pin-running#readme",
   "bugs": {
-    "url": "https://github.com/c66-m/dsh-pin/issues"
+    "url": "https://github.com/c66-m/dsh-pin-running/issues"
   }
 }

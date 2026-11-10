@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import { nativeMonitorArgs } from '../index.js'
 
 const source = await readFile(new URL('../client.js', import.meta.url), 'utf8')
 let exported
@@ -15,7 +16,14 @@ globalThis.window = {
 }
 new Function('window', source)(globalThis.window)
 
-const { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked, terminalStateFromEntries, visiblePinnedRows, shouldAutoExpand } = exported._test
+const { buildPinnedRows, relativeTime, pruneViewedCompleted, pruneStaleTracked, forgetTracked, terminalStateFromEntries, visiblePinnedRows, shouldAutoExpand, readCurrentId, repairCurrentIdStorage, markPinnedAreaActive, windowPositionFromPrefs, progressFromEntries, buildMonitorRows, monitorDetail, installRecentOrder } = exported._test
+
+test('nativeMonitorArgs launches the WPF monitor with origin and script', () => {
+  const args = nativeMonitorArgs('http://127.0.0.1:6425', 'C:/plugin/monitor.ps1')
+  assert.ok(args.includes('-STA'))
+  assert.equal(args[args.indexOf('-File') + 1], 'C:/plugin/monitor.ps1')
+  assert.equal(args[args.indexOf('-Origin') + 1], 'http://127.0.0.1:6425')
+})
 
 test('buildPinnedRows lists tracked sessions, completed ones stay until consumed', () => {
   const now = 1000 * 60 * 10
@@ -71,12 +79,20 @@ test('buildPinnedRows trusts live status over stale summary running flag', () =>
   assert.equal(done[0].running, false)
 })
 
-test('terminalStateFromEntries marks abnormal or unfinished turns as interrupted', () => {
+test('terminalStateFromEntries treats manual user stop as normal completion', () => {
   const entry = (seq, type, data) => ({ event: { seq, type, data } })
   assert.equal(terminalStateFromEntries([
     entry(1, 'turn/start', {}),
     entry(2, 'turn/end', { reason: { kind: 'completed' } }),
   ]), 'completed')
+  assert.equal(terminalStateFromEntries([
+    entry(1, 'turn/start', {}),
+    entry(2, 'turn/end', { reason: { kind: 'aborted', reason: { kind: 'user' } } }),
+  ]), 'completed')
+  assert.equal(terminalStateFromEntries([
+    entry(1, 'turn/start', {}),
+    entry(2, 'turn/end', { reason: { kind: 'aborted', reason: { kind: 'parent' } } }),
+  ]), 'interrupted')
   assert.equal(terminalStateFromEntries([
     entry(1, 'turn/start', {}),
     entry(2, 'turn/end', { reason: { kind: 'interrupted' } }),
@@ -129,17 +145,17 @@ test('completed viewed items are consumed only after switching to another task',
   assert.deepEqual([...viewed], ['running'])
 })
 
-test('visiblePinnedRows collapses running rows but keeps finished rows fully visible', () => {
+test('visiblePinnedRows collapses every row so finished-only lists can shrink', () => {
   const rows = [
     { id: 'run1', state: 'running' },
     { id: 'run2', state: 'running' },
     { id: 'done1', state: 'completed' },
     { id: 'failed', state: 'interrupted' },
   ]
-  assert.deepEqual(visiblePinnedRows(rows, false).map((row) => row.id), ['run1', 'done1', 'failed'])
+  assert.deepEqual(visiblePinnedRows(rows, false), [])
   assert.deepEqual(visiblePinnedRows(rows, true).map((row) => row.id), ['run1', 'run2', 'done1', 'failed'])
   assert.deepEqual(visiblePinnedRows([], false), [])
-  assert.deepEqual(visiblePinnedRows([{ id: 'only', state: 'completed' }], false).map((row) => row.id), ['only'])
+  assert.deepEqual(visiblePinnedRows([{ id: 'only', state: 'completed' }], false), [])
 })
 
 test('completed transition auto-expands the collapsed pinned bar', () => {
@@ -161,17 +177,21 @@ test('relativeTime switches units', () => {
   assert.equal(relativeTime(1000, 1000 + 3 * 24 * 3600 * 1000), '3天')
 })
 
-test('apply never calls native pin/unpin', () => {
+test('apply never calls native pin/unpin and disposes a previous hot-reload mount', () => {
   let touched = false
+  let cleaned = 0
   const services = {
     uiWorkspace: {
       pinSession: () => { touched = true },
       unpinSession: () => { touched = true },
     },
   }
+  globalThis.window.__dshPinRunningCleanup__ = () => { cleaned += 1 }
   const ctx = { get: (name) => services[name], effect: (fn) => fn() }
   exported.apply(ctx)
   assert.equal(touched, false)
+  assert.equal(cleaned, 1)
+  assert.equal(globalThis.window.__dshPinRunningCleanup__, undefined)
 })
 
 test('pruneStaleTracked drops archived, missing, blank and subagent ids', () => {
@@ -191,4 +211,175 @@ test('pruneStaleTracked drops archived, missing, blank and subagent ids', () => 
   assert.deepEqual([...tracked].sort(), ['done', 'run'])
   assert.deepEqual([...viewed].sort(), ['run'])
   assert.equal(pruneStaleTracked(tracked, viewed, list), false)
+})
+
+test('forgetTracked removes an interrupted task from every pinned set', () => {
+  const tracked = new Set(['failed', 'run'])
+  const viewed = new Set(['failed'])
+  const interrupted = new Set(['failed'])
+  assert.equal(forgetTracked(tracked, viewed, interrupted, 'failed'), true)
+  assert.deepEqual([...tracked], ['run'])
+  assert.equal(viewed.size, 0)
+  assert.equal(interrupted.size, 0)
+  assert.equal(forgetTracked(tracked, viewed, interrupted, 'missing'), false)
+})
+
+function memoryStorage(initial = {}) {
+  const map = new Map(Object.entries(initial))
+  return {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => map.set(key, String(value)),
+    dump: () => Object.fromEntries(map),
+  }
+}
+
+test('readCurrentId prefers live workspace selection over stale persisted state', () => {
+  const storage = memoryStorage({
+    'dsh.sessions.current': JSON.stringify({ sessionId: 'session-old' }),
+  })
+  const uiWorkspace = { selection: { getSnapshot: () => ({ sessionId: 'session-live' }) } }
+  assert.equal(readCurrentId(uiWorkspace, storage), 'session-live')
+})
+
+test('readCurrentId falls back to persisted JSON and legacy bare session ids', () => {
+  assert.equal(
+    readCurrentId({}, memoryStorage({ 'dsh.sessions.current': JSON.stringify({ sessionId: 'session-json' }) })),
+    'session-json',
+  )
+  assert.equal(
+    readCurrentId({}, memoryStorage({ 'dsh.sessions.current': 'session-legacy' })),
+    'session-legacy',
+  )
+  assert.equal(readCurrentId({}, memoryStorage({ 'dsh.sessions.current': 'not-a-session' })), '')
+})
+
+test('repairCurrentIdStorage normalizes legacy bare ids and leaves valid DSH state alone', () => {
+  const legacy = memoryStorage({ 'dsh.sessions.current': 'session-legacy' })
+  assert.equal(repairCurrentIdStorage(legacy), true)
+  assert.equal(legacy.getItem('dsh.sessions.current'), JSON.stringify({ sessionId: 'session-legacy' }))
+  assert.equal(repairCurrentIdStorage(legacy), false)
+
+  const valid = memoryStorage({ 'dsh.sessions.current': JSON.stringify({ sessionId: 'session-ok' }) })
+  assert.equal(repairCurrentIdStorage(valid), false)
+  assert.equal(valid.getItem('dsh.sessions.current'), JSON.stringify({ sessionId: 'session-ok' }))
+})
+
+test('markPinnedAreaActive deactivates and hides older pinned areas', () => {
+  const makeArea = () => ({ attrs: {}, style: {}, setAttribute(key, value) { this.attrs[key] = value } })
+  const older = makeArea()
+  const area = makeArea()
+  markPinnedAreaActive(area, { querySelectorAll: () => [older] })
+  assert.equal(older.attrs['data-dsh-pin-active'], 'false')
+  assert.equal(older.style.display, 'none')
+  assert.equal(area.attrs['data-dsh-pin-active'], 'true')
+  assert.equal(area.style.display, '')
+})
+
+test('windowPositionFromPrefs ignores coordinates saved by the old window version', () => {
+  assert.deepEqual(windowPositionFromPrefs({ v: 2, left: 8, top: 8 }), { left: null, top: null })
+  assert.deepEqual(windowPositionFromPrefs({ v: 3, left: 347, top: 47 }), { left: null, top: null })
+  assert.deepEqual(windowPositionFromPrefs({ v: 4, left: 433, top: 64 }), { left: 433, top: 64 })
+  assert.deepEqual(windowPositionFromPrefs({ v: 4, left: 'bad', top: 64 }), { left: null, top: 64 })
+})
+
+test('progressFromEntries reads the latest turn, step, tool and todo state', () => {
+  const entry = (type, data) => ({ event: { type, data } })
+  const progress = progressFromEntries([
+    entry('turn/start', { turn: 1 }),
+    entry('step/start', { step: 1 }),
+    entry('tool/call', { name: 'read' }),
+    entry('todo/write', { todos: [
+      { content: '读代码', status: 'completed' },
+      { content: '写测试', status: 'in_progress' },
+      { content: '改实现', status: 'pending' },
+    ] }),
+    entry('step/start', { step: 2 }),
+    entry('tool/call', { name: 'run_code' }),
+  ])
+  assert.equal(progress.turn, 1)
+  assert.equal(progress.step, 2)
+  assert.equal(progress.tool, 'run_code')
+  assert.equal(progress.todoDone, 1)
+  assert.equal(progress.todoTotal, 3)
+  assert.equal(progress.todoText, '写测试')
+})
+
+test('progressFromEntries starts the new turn clean but keeps the last todo plan', () => {
+  const entry = (type, data) => ({ event: { type, data } })
+  const progress = progressFromEntries([
+    entry('turn/start', { turn: 1 }),
+    entry('todo/write', { todos: [{ content: '发布', status: 'pending' }] }),
+    entry('step/start', { step: 2 }),
+    entry('tool/call', { name: 'git' }),
+    entry('turn/start', { turn: 2 }),
+  ])
+  assert.equal(progress.turn, 2)
+  assert.equal(progress.step, 0)
+  assert.equal(progress.tool, '')
+  assert.equal(progress.todoTotal, 1)
+})
+
+test('buildMonitorRows puts running first, then interrupted, then completed and attaches progress', () => {
+  const rows = [
+    { id: 'done', state: 'completed', updatedAt: 40 },
+    { id: 'run-old', state: 'running', updatedAt: 10 },
+    { id: 'failed', state: 'interrupted', updatedAt: 30 },
+    { id: 'run-new', state: 'running', updatedAt: 20 },
+  ]
+  const progress = new Map([['run-new', { turn: 2, step: 3, todoDone: 1, todoTotal: 4, todoText: '写测试' }]])
+  const result = buildMonitorRows(rows, progress)
+  assert.deepEqual(result.map((row) => row.id), ['run-new', 'run-old', 'failed', 'done'])
+  assert.equal(result[0].progress.todoDone, 1)
+  assert.equal(result[1].progress, null)
+})
+
+test('buildMonitorRows surfaces pending questions first and labels them', () => {
+  const rows = [
+    { id: 'done', state: 'completed', updatedAt: 40 },
+    { id: 'waiting', state: 'running', updatedAt: 10 },
+    { id: 'run', state: 'running', updatedAt: 20 },
+  ]
+  const statuses = new Map([
+    ['waiting', { pendingInteraction: { kind: 'question', questions: [{ question: '要选哪一个？' }] } }],
+  ])
+  const result = buildMonitorRows(rows, new Map(), statuses)
+  assert.deepEqual(result.map((row) => row.id), ['waiting', 'run', 'done'])
+  assert.equal(result[0].pendingKind, 'question')
+  assert.equal(result[0].pendingText, '要选哪一个？')
+  assert.equal(monitorDetail(result[0]), '等待回答')
+})
+
+test('monitorDetail shows only the task status label', () => {
+  assert.equal(monitorDetail({ state: 'running', time: '刚刚' }, { turn: 2, step: 3, tool: 'run_code', todoDone: 1, todoTotal: 4, todoText: '写测试' }), '任务进行中')
+  assert.equal(monitorDetail({ state: 'running', time: '刚刚' }, { turn: 2, step: 3, tool: 'run_code' }), '任务进行中')
+  assert.equal(monitorDetail({ state: 'running', time: '刚刚' }, null), '任务进行中')
+  assert.equal(monitorDetail({ state: 'interrupted', time: '2分钟' }, null), '任务中断')
+  assert.equal(monitorDetail({ state: 'completed', time: '3分钟' }, null), '任务完成')
+})
+
+test('installRecentOrder switches manual workspace order to recent', () => {
+  const previous = globalThis.localStorage
+  const values = new Map([['dsh.workspace.view.v5', JSON.stringify({ groupBy: 'workspace', orderBy: 'manual' })]])
+  const calls = []
+  globalThis.localStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+  }
+  const ctx = {
+    get(name) {
+      if (name !== 'slots') return undefined
+      return {
+        entries() {
+          return [{ store: { create() { return { actions: { setOrderBy(mode) { calls.push(mode) } } } } } }]
+        },
+      }
+    },
+  }
+  try {
+    installRecentOrder(ctx)
+    assert.deepEqual(calls, ['updated'])
+    assert.equal(values.get('dsh-pin-running.recent-order.v1'), '1')
+  } finally {
+    globalThis.localStorage = previous
+  }
 })

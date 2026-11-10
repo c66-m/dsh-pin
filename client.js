@@ -12,11 +12,24 @@ window.__ModuleLoader__.load({
   id: 'dsh-pin-running',
   factory: () => {
     const NAME = '[pin-running]'
-    const STYLE_ID = 'dsh-pin-running-style'
+    const STYLE_ID = 'dsh-pin-running-style-v4'
     const CURRENT_KEY = 'dsh.sessions.current'
     const STORE_KEY = 'dsh-pin-running.tasks.v1'
     const VIEWED_KEY = 'dsh-pin-running.viewed.v1'
     const INTERRUPTED_KEY = 'dsh-pin-running.interrupted.v1'
+    const WINDOW_KEY = 'dsh-pin-running.window.v1'
+    const MONITOR_PREFIX = '/dsh-pin-running'
+
+    /** 和 Host 半端通信：任务快照、焦点队列、独立窗口开关。 */
+    function monitorRequest(path, body) {
+      if (typeof fetch !== 'function') return Promise.resolve(null)
+      const init = body === undefined
+        ? { cache: 'no-store' }
+        : { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
+      return fetch(MONITOR_PREFIX + path, init)
+        .then((response) => response.ok ? response.json() : null)
+        .catch(() => null)
+    }
 
     /** 运行状态以 uiSession.sessionStatus 为准，缺失时退回会话摘要。 */
     function isRunning(session, status) {
@@ -48,6 +61,77 @@ window.__ModuleLoader__.load({
     const saveTracked = (ids) => saveIds(STORE_KEY, ids, 'tasks')
     const saveViewed = (ids) => saveIds(VIEWED_KEY, ids, 'viewed')
     const saveInterrupted = (ids) => saveIds(INTERRUPTED_KEY, ids, 'interrupted')
+
+    /** 从 DSH 持久化值里解析 sessionId：新格式是 {"sessionId":"..."}，旧版插件可能留下裸 id。 */
+    function parseCurrentId(raw) {
+      if (!raw) return ''
+      try {
+        const parsed = JSON.parse(raw)
+        if (typeof parsed === 'string') return parsed.startsWith('session-') ? parsed : ''
+        if (parsed && typeof parsed === 'object' && typeof parsed.sessionId === 'string' && parsed.sessionId) {
+          return parsed.sessionId
+        }
+      } catch {
+        return raw.startsWith('session-') ? raw : ''
+      }
+      return ''
+    }
+
+    /** 当前会话优先读 uiWorkspace.selection；它才是 DSH 的真实状态，localStorage 只做回退。 */
+    function readCurrentId(uiWorkspace, storage) {
+      try {
+        const selection = uiWorkspace && uiWorkspace.selection
+        const snapshot = selection && typeof selection.getSnapshot === 'function' ? selection.getSnapshot() : null
+        if (snapshot && typeof snapshot.sessionId === 'string' && snapshot.sessionId) return snapshot.sessionId
+      } catch {}
+      return parseCurrentId(storage && typeof storage.getItem === 'function' ? storage.getItem(CURRENT_KEY) : '')
+    }
+
+    /** 旧版插件把裸 sessionId 写进 DSH 的持久化键，启动时修回对象格式，避免下次刷新丢当前会话。 */
+    function repairCurrentIdStorage(storage) {
+      if (!storage || typeof storage.getItem !== 'function') return false
+      let raw
+      try {
+        raw = storage.getItem(CURRENT_KEY)
+      } catch {
+        return false
+      }
+      if (!raw) return false
+      let parsed
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        if (!raw.startsWith('session-')) return false
+        try {
+          storage.setItem(CURRENT_KEY, JSON.stringify({ sessionId: raw }))
+          return true
+        } catch {
+          return false
+        }
+      }
+      if (typeof parsed === 'string' && parsed.startsWith('session-')) {
+        try {
+          storage.setItem(CURRENT_KEY, JSON.stringify({ sessionId: parsed }))
+          return true
+        } catch {
+          return false
+        }
+      }
+      return false
+    }
+
+    /** 同一页面只让最新一块置顶区可见；旧 HMR 实例留下的区域由 CSS 兜底隐藏。 */
+    function markPinnedAreaActive(area, root) {
+      const doc = root || (typeof document !== 'undefined' ? document : null)
+      if (doc && typeof doc.querySelectorAll === 'function') {
+        for (const existing of doc.querySelectorAll('.dsh-pin-running-area')) {
+          existing.setAttribute('data-dsh-pin-active', 'false')
+          if (existing !== area && existing.style) existing.style.display = 'none'
+        }
+      }
+      area.setAttribute('data-dsh-pin-active', 'true')
+      if (area.style) area.style.display = ''
+    }
 
     /**
      * 切到别的任务时才消费：已完成、且点开看过的项从置顶区移除。
@@ -91,11 +175,17 @@ window.__ModuleLoader__.load({
       return changed
     }
 
-    /** 收起时只藏运行中的多余行；完成/中断行不受收起影响，始终完整显示。 */
+    /** 用户从小窗/置顶区删掉一个任务：三个持久化集合一起清，避免残留。 */
+    function forgetTracked(tracked, viewed, interrupted, id) {
+      const had = tracked.delete(id)
+      viewed.delete(id)
+      interrupted.delete(id)
+      return had
+    }
+
+    /** 收起时整区只留标题；展开时显示全部行。 */
     function visiblePinnedRows(rows, expanded) {
-      if (expanded) return rows
-      const firstRunning = rows.findIndex((row) => row.state === 'running')
-      return rows.filter((row, index) => row.state !== 'running' || index === firstRunning)
+      return expanded ? rows : []
     }
 
     /** 运行中的任务刚结束（完成/失败/中断）时强制展开，别让完成状态被收起遮住。 */
@@ -119,8 +209,9 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 从会话事件里读最后一轮的状态：completed 以外（error/aborted/interrupted/
-     * max-tokens/blocked）或只有 turn/start 没有 turn/end，都算中断。
+     * 从会话事件里读最后一轮的状态：completed 和用户手动停止（aborted/user）
+     * 算正常完成；error/aborted/interrupted/max-tokens/blocked 等或只有
+     * turn/start 没有 turn/end，都算中断。
      */
     function terminalStateFromEntries(entries) {
       let state
@@ -129,11 +220,135 @@ window.__ModuleLoader__.load({
         if (!event) continue
         if (event.type === 'turn/start') state = 'interrupted'
         else if (event.type === 'turn/end') {
-          const kind = event.data && event.data.reason && event.data.reason.kind
-          state = kind === 'completed' ? 'completed' : 'interrupted'
+          const reason = event.data && event.data.reason
+          const kind = reason && reason.kind
+          const manualStop = kind === 'aborted' && reason.reason && reason.reason.kind === 'user'
+          state = kind === 'completed' || manualStop ? 'completed' : 'interrupted'
         }
       }
       return state
+    }
+
+    /**
+     * 从事件流里读最近一轮的进度：轮次、步骤、最近工具、todo 完成数。
+     * 所有字段都只用于小窗口展示，不参与置顶/清理判断。
+     */
+    function progressFromEntries(entries) {
+      let turn = 0
+      let step = 0
+      let tool = ''
+      let todos = null
+      for (const entry of entries || []) {
+        const event = entry && entry.event
+        if (!event) continue
+        const data = event.data || {}
+        if (event.type === 'turn/start') {
+          turn = Number(data.turn) || 0
+          step = 0
+          tool = ''
+        } else if (event.type === 'step/start') {
+          step = Number(data.step) || 0
+          tool = ''
+        } else if (event.type === 'tool/call') {
+          tool = typeof data.name === 'string' ? data.name : ''
+        } else if (event.type === 'todo/write' && Array.isArray(data.todos)) {
+          todos = data.todos
+        }
+      }
+      const total = todos ? todos.length : 0
+      const done = todos ? todos.filter((todo) => todo && todo.status === 'completed').length : 0
+      const active = todos ? todos.find((todo) => todo && todo.status === 'in_progress') : null
+      return { turn, step, tool, todoDone: done, todoTotal: total, todoText: (active && active.content) || '' }
+    }
+
+    const PENDING_LABELS = { approval: '等待审批', 'plan-review': '计划待审', question: '等待回答' }
+
+    /** 只把 DSH 认得的交互类型带到小窗；未知交互不打扰。 */
+    function pendingKindOf(status) {
+      const kind = status && status.pendingInteraction && status.pendingInteraction.kind
+      return PENDING_LABELS[kind] ? kind : ''
+    }
+
+    /** 小窗能显示的具体问题/审批原因，点击整行仍走 DSH 原生交互。 */
+    function pendingTextOf(status) {
+      const interaction = status && status.pendingInteraction
+      if (!interaction) return ''
+      const question = Array.isArray(interaction.questions) ? interaction.questions[0] : null
+      if (question && typeof question.question === 'string') return question.question
+      if (typeof interaction.displayReason === 'string') return interaction.displayReason
+      if (typeof interaction.reason === 'string') return interaction.reason
+      return ''
+    }
+
+    function monitorStatusLabel(row) {
+      if (row && row.pendingKind) return PENDING_LABELS[row.pendingKind] || '等待选择'
+      if (!row) return ''
+      if (row.state === 'interrupted') return '任务中断'
+      if (row.state === 'completed') return '任务完成'
+      return '任务进行中'
+    }
+
+    /** 小窗口按「待选择 → 运行中 → 中断 → 完成」排；完成项也保留但排最后。 */
+    function buildMonitorRows(rows, progressById, statusMap) {
+      const rank = { pending: 0, running: 1, interrupted: 2, completed: 3 }
+      return [...(rows || [])].map((row) => {
+        const status = statusMap && typeof statusMap.get === 'function' ? statusMap.get(row.id) : null
+        const pendingKind = pendingKindOf(status)
+        return {
+          ...row,
+          pendingKind,
+          pendingText: pendingKind ? pendingTextOf(status) : '',
+          progress: progressById && typeof progressById.get === 'function' ? progressById.get(row.id) || null : null,
+        }
+      }).sort((a, b) => {
+        const ar = a.pendingKind ? rank.pending : rank[a.state]
+        const br = b.pendingKind ? rank.pending : rank[b.state]
+        return ar - br || b.updatedAt - a.updatedAt
+      })
+    }
+
+    /** 小窗第二行只显示状态，不再显示轮次/步骤明细。 */
+    function monitorDetail(row, progress) {
+      return monitorStatusLabel(row)
+    }
+
+    /** 同一页面只让最新一个小窗口可见，旧 HMR 实例留下的窗口由 CSS 兜底隐藏。 */
+    function markTaskWindowActive(win, root) {
+      const doc = root || (typeof document !== 'undefined' ? document : null)
+      if (doc && typeof doc.querySelectorAll === 'function') {
+        for (const existing of doc.querySelectorAll('.dsh-task-window')) {
+          existing.setAttribute('data-dsh-task-active', 'false')
+          if (existing !== win && existing.style) existing.style.display = 'none'
+        }
+      }
+      win.setAttribute('data-dsh-task-active', 'true')
+      if (win.style) win.style.display = ''
+    }
+
+    function loadWindowPrefs() {
+      try {
+        const value = JSON.parse(localStorage.getItem(WINDOW_KEY) || 'null')
+        return value && typeof value === 'object' ? value : {}
+      } catch {
+        return {}
+      }
+    }
+
+    /** 只有 v3 起保存的坐标可信；旧版把窗口钳到左上角 8,8，不能恢复。 */
+    function windowPositionFromPrefs(prefs) {
+      const trusted = prefs && prefs.v === 4
+      return {
+        left: trusted && Number.isFinite(Number(prefs.left)) ? Number(prefs.left) : null,
+        top: trusted && Number.isFinite(Number(prefs.top)) ? Number(prefs.top) : null,
+      }
+    }
+
+    function saveWindowPrefs(prefs) {
+      try {
+        localStorage.setItem(WINDOW_KEY, JSON.stringify(prefs))
+      } catch (error) {
+        console.warn(NAME, 'save window prefs failed', error)
+      }
     }
 
     /**
@@ -178,11 +393,16 @@ window.__ModuleLoader__.load({
     /** 注入一次样式；颜色走 currentColor/透明度，亮暗主题都能用。 */
     function installStyle() {
       if (document.getElementById(STYLE_ID)) return
+      for (const id of ['dsh-pin-running-style', 'dsh-pin-running-style-v2', 'dsh-pin-running-style-v3']) {
+        const old = document.getElementById(id)
+        if (old) old.remove()
+      }
       const style = document.createElement('style')
       style.id = STYLE_ID
       style.textContent = `
         .dsh-pin-running-area { display: flex; flex-direction: column; gap: 1px; padding: 0 8px 6px; flex: 0 0 auto; max-height: min(40vh, 320px); overflow-y: auto; }
         .dsh-pin-running-area[hidden] { display: none; }
+        .dsh-pin-running-area:not([data-dsh-pin-active="true"]) { display: none !important; }
         .dsh-pin-running-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 11px; letter-spacing: .08em; text-align: left; cursor: pointer; opacity: .55; }
         .dsh-pin-running-head:hover { background: color-mix(in srgb, currentColor 8%, transparent); opacity: .8; }
         .dsh-pin-running-head[data-expanded="true"] { opacity: .7; }
@@ -197,8 +417,42 @@ window.__ModuleLoader__.load({
         .dsh-pin-running-dot[data-state="interrupted"] { background: #e0a400; box-shadow: 0 0 0 3px rgba(224, 164, 0, .22); }
         .dsh-pin-running-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .dsh-pin-running-time { flex: none; font-size: 11px; opacity: .5; font-variant-numeric: tabular-nums; }
+        .dsh-pin-running-remove { flex: none; width: 15px; height: 15px; display: grid; place-items: center; border-radius: 4px; font-size: 13px; line-height: 1; opacity: .5; }
+        .dsh-pin-running-remove:hover { background: color-mix(in srgb, currentColor 14%, transparent); opacity: 1; }
         .dsh-pin-running-notice { padding: 4px 8px 6px; font-size: 11px; opacity: .6; }
         @keyframes dsh-pin-running-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+
+        .dsh-task-window-toggle { display: none; position: fixed; top: 8px; right: 140px; z-index: 2147483000; width: 30px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; place-items: center; opacity: .5; -webkit-app-region: no-drag; }
+        html[data-windows-titlebar] .dsh-task-window-toggle { display: grid; }
+        .dsh-task-window-toggle:hover { background: color-mix(in srgb, currentColor 12%, transparent); opacity: .9; }
+        .dsh-task-window-toggle[data-active="true"] { opacity: 1; color: #e0a400; }
+        .dsh-task-window-toggle svg { width: 14px; height: 14px; }
+
+        .dsh-task-window { position: fixed; z-index: 30; width: 268px; box-sizing: border-box; border: .5px solid var(--dsw-alias-border-l3, rgba(127, 127, 127, .3)); border-radius: 12px; background: color-mix(in srgb, var(--dsw-alias-bg-base, #fff) 94%, transparent); color: var(--dsw-alias-text-primary, inherit); box-shadow: 0 8px 28px rgba(0, 0, 0, .18); backdrop-filter: blur(16px); font-family: var(--dsh-font-family-text, inherit); font-size: 12px; overflow: hidden; pointer-events: auto; }
+        .dsh-task-window[data-pinned="true"] { z-index: 999; box-shadow: 0 12px 36px rgba(0, 0, 0, .24); }
+        .dsh-task-window[data-pinned="false"] { opacity: .9; }
+        .dsh-task-window:not([data-dsh-task-active="true"]) { display: none !important; }
+        .dsh-task-window[data-open="false"] { display: none !important; }
+        .dsh-task-window[data-collapsed="true"] { width: 156px; }
+        .dsh-task-window[data-collapsed="true"] .dsh-task-window-body { display: none; }
+        .dsh-task-window-head { display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 6px 0 9px; cursor: move; user-select: none; }
+        .dsh-task-window-head:active { cursor: grabbing; }
+        .dsh-task-window-title { font-size: 11px; letter-spacing: .04em; opacity: .68; white-space: nowrap; }
+        .dsh-task-window-count { padding: 1px 5px; border-radius: 999px; background: color-mix(in srgb, currentColor 10%, transparent); font-size: 10px; line-height: 14px; font-variant-numeric: tabular-nums; opacity: .65; }
+        .dsh-task-window-spacer { flex: 1; }
+        .dsh-task-window-btn { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 13px; line-height: 1; cursor: pointer; opacity: .5; }
+        .dsh-task-window-btn:hover { background: color-mix(in srgb, currentColor 10%, transparent); opacity: .9; }
+        .dsh-task-window-pin[aria-pressed="true"] { opacity: 1; color: #e0a400; }
+        .dsh-task-window-body { display: flex; flex-direction: column; gap: 1px; max-height: 232px; overflow-y: auto; padding: 0 6px 7px; }
+        .dsh-task-window-row { display: flex; align-items: flex-start; gap: 7px; width: 100%; padding: 6px; border: 0; border-radius: 7px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+        .dsh-task-window-row:hover { background: color-mix(in srgb, currentColor 9%, transparent); }
+        .dsh-task-window-row[data-current="true"] { background: color-mix(in srgb, currentColor 13%, transparent); }
+        .dsh-task-window-row .dsh-pin-running-dot { margin-top: 4px; }
+        .dsh-task-window-main { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
+        .dsh-task-window-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 15px; }
+        .dsh-task-window-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; line-height: 13px; opacity: .48; font-variant-numeric: tabular-nums; }
+        .dsh-task-window-row[data-state="interrupted"] .dsh-task-window-detail { color: #e0a400; opacity: .82; }
+        .dsh-task-window-empty { padding: 5px 6px 8px; font-size: 11px; opacity: .45; }
       `
       document.head.appendChild(style)
     }
@@ -229,8 +483,10 @@ window.__ModuleLoader__.load({
       const statuses = ctx.get('uiSession')?.sessionStatus
       let tracked = loadTracked()
       const viewed = loadViewed()
-      let currentId = localStorage.getItem(CURRENT_KEY) || ''
-      let expanded = false
+      const storage = typeof localStorage !== 'undefined' ? localStorage : null
+      if (storage) repairCurrentIdStorage(storage)
+      let currentId = readCurrentId(uiWorkspace, storage)
+      let expanded = true
       const previousStates = new Map()
       let mountWarned = false
 
@@ -238,6 +494,33 @@ window.__ModuleLoader__.load({
       const area = document.createElement('div')
       area.className = 'dsh-pin-running-area'
       area.hidden = true
+      markPinnedAreaActive(area)
+
+      // 任务监控是独立的本机浏览器 --app 窗口，由 Host 半端启动。渲染器里
+      // 只保留标题栏入口；旧版 DOM 浮层（含 HMR 残留）在安装时清掉。
+      for (const stale of document.querySelectorAll('.dsh-task-window, .dsh-task-window-toggle')) stale.remove()
+      const toggleBtn = document.createElement('button')
+      toggleBtn.type = 'button'
+      toggleBtn.className = 'dsh-task-window-toggle'
+      toggleBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="12" height="9" rx="2"></rect><rect x="9" y="10" width="12" height="9" rx="2"></rect></svg>'
+      document.body.appendChild(toggleBtn)
+
+      let monitorOpen = false
+      const applyMonitorChrome = () => {
+        toggleBtn.dataset.active = String(monitorOpen)
+        toggleBtn.title = monitorOpen ? '关闭任务监控窗口' : '打开任务监控窗口'
+        toggleBtn.setAttribute('aria-label', toggleBtn.title)
+        toggleBtn.setAttribute('aria-pressed', String(monitorOpen))
+      }
+      const setMonitorOpen = (open) => {
+        monitorOpen = Boolean(open)
+        applyMonitorChrome()
+      }
+      toggleBtn.addEventListener('click', async () => {
+        const state = await monitorRequest('/window', { action: monitorOpen ? 'close' : 'open' })
+        if (state) setMonitorOpen(state.open)
+      })
+      monitorRequest('/window').then((state) => { if (state) setMonitorOpen(state.open) })
 
       const ensureMounted = () => {
         const mount = findMount()
@@ -294,8 +577,34 @@ window.__ModuleLoader__.load({
         })
       }
 
+      // 监控窗口点任务时把 id 塞进 Host 的 pendingFocus，这里取一次就清空。
+      const focusTimer = setInterval(async () => {
+        const data = await monitorRequest('/focus')
+        if (data && typeof data.id === 'string' && data.id) open(data.id)
+      }, 700)
+
+      let lastMonitorPayload = ''
+      /** 从小窗删除一个任务：只删置顶壳子，不碰 DSH 会话本身。 */
+      const removeTracked = (id) => {
+        if (!forgetTracked(tracked, viewed, interrupted, id)) return
+        saveTracked(tracked)
+        saveViewed(viewed)
+        saveInterrupted(interrupted)
+        progressById.delete(id)
+        unwatch(id)
+        lastMonitorPayload = ''
+        render()
+      }
+
+      // 小窗的「删除置顶」按钮写入 Host 的 pendingRemove，这里取一次就清空。
+      const removeTimer = setInterval(async () => {
+        const data = await monitorRequest('/remove')
+        if (data && typeof data.id === 'string' && data.id) removeTracked(data.id)
+      }, 700)
+
       const interrupted = loadInterrupted()
       const watchers = new Map()
+      const progressById = new Map()
 
       /** 会话此刻是否仍在跑。运行中的行本来就显示绿点，不该判成「中断」。 */
       const isRunningNow = (id) => {
@@ -345,7 +654,14 @@ window.__ModuleLoader__.load({
           if (!source || typeof source.getSnapshot !== 'function') return
           const check = () => {
             if (holder.cancelled) return
-            const state = terminalStateFromEntries(source.getSnapshot().entries)
+            const entries = source.getSnapshot().entries
+            const state = terminalStateFromEntries(entries)
+            const progress = progressFromEntries(entries)
+            const last = progressById.get(id)
+            if (!last || JSON.stringify(last) !== JSON.stringify(progress)) {
+              progressById.set(id, progress)
+              scheduleRender()
+            }
             if (state === 'interrupted') setInterrupted(id, true)
             else if (state === 'completed') setInterrupted(id, false)
           }
@@ -357,12 +673,57 @@ window.__ModuleLoader__.load({
         })
       }
 
+      /** 侧栏和窗口共用同一套点击语义：切走时消费已看完成的旧项，运行/中断项保留。 */
+      const activate = (row) => {
+        const listNow = sessions.list.getSnapshot()
+        const statusNow = statuses ? statuses.getSnapshot() : undefined
+        const runningById = (id) => isRunning(listNow.byId[id], statusNow && statusNow.get(id))
+        if (currentId && currentId !== row.id && pruneViewedCompleted(tracked, viewed, runningById, row.id, isInterruptedNow)) {
+          saveTracked(tracked)
+          saveViewed(viewed)
+        }
+        currentId = row.id
+        // 运行中的点击只打开；失败/中断的要一直停留；完成的先留壳，等下次切换再清。
+        if (!row.running && !row.interrupted) {
+          viewed.add(row.id)
+          saveViewed(viewed)
+        }
+        render()
+        open(row.id)
+      }
+
+      let pendingKey = ''
+      const publishMonitor = (rows, statusMap) => {
+        const monitorRows = buildMonitorRows(rows, progressById, statusMap).map((row) => ({
+          id: row.id,
+          title: row.title,
+          state: row.state,
+          current: Boolean(row.current),
+          path: row.path || '',
+          detail: row.pendingKind ? monitorDetail(row) + (row.pendingText ? '|' + row.pendingText : '') : monitorDetail(row, row.progress),
+          pendingKind: row.pendingKind || '',
+          pendingText: row.pendingText || '',
+        }))
+        const payload = JSON.stringify({ rows: monitorRows })
+        if (payload === lastMonitorPayload) return
+        lastMonitorPayload = payload
+        monitorRequest('/tasks', { rows: monitorRows })
+        const nextPendingKey = monitorRows.filter((row) => row.pendingKind).map((row) => row.id + ':' + row.pendingKind).join(',')
+        if (nextPendingKey && nextPendingKey !== pendingKey) {
+          pendingKey = nextPendingKey
+          monitorRequest('/window', { action: 'open' }).then((state) => { if (state) setMonitorOpen(state.open) })
+        } else if (!nextPendingKey) {
+          pendingKey = ''
+        }
+      }
+
       const render = () => {
         ensureMounted()
         const list = sessions.list.getSnapshot()
         const registry = workspaces.list.getSnapshot()
         if (!list || list.phase !== 'ready' || !registry || registry.phase !== 'ready') {
           area.hidden = true
+          publishMonitor([])
           return
         }
         const statusMap = statuses ? statuses.getSnapshot() : undefined
@@ -394,31 +755,27 @@ window.__ModuleLoader__.load({
           if (!visible.has(id)) unwatch(id)
         }
         area.hidden = rows.length === 0
+        publishMonitor(rows, statusMap)
         area.replaceChildren()
 
-        const collapsedRows = visiblePinnedRows(rows, false)
-        const canToggle = collapsedRows.length < rows.length
         const head = document.createElement('button')
         head.type = 'button'
         head.className = 'dsh-pin-running-head'
         head.dataset.expanded = String(expanded)
-        head.title = canToggle ? (expanded ? '收起置顶' : '展开置顶') : ''
+        head.title = expanded ? '收起置顶' : '展开置顶'
         const label = document.createElement('span')
         label.textContent = '置顶'
         const count = document.createElement('span')
         count.className = 'dsh-pin-running-count'
-        count.textContent = canToggle && !expanded ? collapsedRows.length + '/' + rows.length : String(rows.length)
-        head.append(label, count)
-        if (canToggle) {
-          const chevron = document.createElement('span')
-          chevron.className = 'dsh-pin-running-chevron'
-          chevron.textContent = '▾'
-          head.append(chevron)
-          head.addEventListener('click', () => {
-            expanded = !expanded
-            render()
-          })
-        }
+        count.textContent = String(rows.length)
+        const chevron = document.createElement('span')
+        chevron.className = 'dsh-pin-running-chevron'
+        chevron.textContent = '▾'
+        head.append(label, count, chevron)
+        head.addEventListener('click', () => {
+          expanded = !expanded
+          render()
+        })
         area.appendChild(head)
 
         for (const row of visiblePinnedRows(rows, expanded)) {
@@ -437,25 +794,19 @@ window.__ModuleLoader__.load({
           time.className = 'dsh-pin-running-time'
           time.textContent = row.time
           button.append(dot, title, time)
-          button.addEventListener('click', () => {
-            const listNow = sessions.list.getSnapshot()
-            const statusNow = statuses ? statuses.getSnapshot() : undefined
-            const runningById = (id) => isRunning(listNow.byId[id], statusNow && statusNow.get(id))
-            // 切到别的任务时，才把「已完成且点开看过」的旧项清掉。
-            if (currentId && currentId !== row.id && pruneViewedCompleted(tracked, viewed, runningById, row.id, isInterruptedNow)) {
-              saveTracked(tracked)
-              saveViewed(viewed)
-            }
-            currentId = row.id
-            localStorage.setItem(CURRENT_KEY, row.id)
-            // 运行中的点击只打开；失败/中断的要一直停留；完成的先留壳，等下次切换再清。
-            if (!row.running && !row.interrupted) {
-              viewed.add(row.id)
-              saveViewed(viewed)
-            }
-            render()
-            open(row.id)
-          })
+          if (row.interrupted) {
+            const remove = document.createElement('span')
+            remove.className = 'dsh-pin-running-remove'
+            remove.textContent = '×'
+            remove.title = '从置顶移除（不删除会话）'
+            remove.setAttribute('role', 'button')
+            remove.addEventListener('click', (event) => {
+              event.stopPropagation()
+              removeTracked(row.id)
+            })
+            button.appendChild(remove)
+          }
+          button.addEventListener('click', () => activate(row))
           area.appendChild(button)
         }
       }
@@ -477,7 +828,7 @@ window.__ModuleLoader__.load({
       }
 
       const syncCurrent = () => {
-        const stored = localStorage.getItem(CURRENT_KEY) || ''
+        const stored = readCurrentId(uiWorkspace, storage)
         if (!stored || stored === currentId) return false
         const list = sessions.list.getSnapshot()
         const statusMap = statuses ? statuses.getSnapshot() : undefined
@@ -494,6 +845,10 @@ window.__ModuleLoader__.load({
 
       const onSessions = sessions.list.subscribe(scheduleRender)
       const onWorkspaces = workspaces.list.subscribe(scheduleRender)
+      const selectionStore = uiWorkspace && uiWorkspace.selection
+      const onSelection = selectionStore && typeof selectionStore.subscribe === 'function'
+        ? selectionStore.subscribe(() => { if (syncCurrent()) scheduleRender() })
+        : () => {}
       const onStatuses = statuses ? statuses.subscribe(scheduleRender) : () => {}
       const remote = ctx.get('remote')
       const offError = remote && typeof remote.$on === 'function'
@@ -502,6 +857,7 @@ window.__ModuleLoader__.load({
       // 原生列表点走别的会话不会触发我们的订阅，轮询 localStorage 兜底。
       const timer = setInterval(() => {
         if (syncCurrent()) render()
+        else if (!area.isConnected) render()
       }, 1000)
       render()
 
@@ -518,13 +874,17 @@ window.__ModuleLoader__.load({
       return () => {
         observer.disconnect()
         clearInterval(timer)
+        clearInterval(focusTimer)
+        clearInterval(removeTimer)
         if (frame) cancelAnimationFrame(frame)
         onSessions()
         onWorkspaces()
+        onSelection()
         onStatuses()
         offError()
         for (const id of [...watchers.keys()]) unwatch(id)
         area.remove()
+        toggleBtn.remove()
       }
     }
 
@@ -579,15 +939,83 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const inject = ['sessions', 'workspaces', 'uiWorkspace', 'uiSession', 'slots']
+    const ORDER_FLAG = 'dsh-pin-running.recent-order.v1'
 
-    function apply(ctx) {
-      ctx.effect(() => installRestoreGrouping(ctx), 'pin-running: restore grouping')
-      if (typeof document !== 'undefined') {
-        ctx.effect(() => installPinnedArea(ctx), 'pin-running: pinned section')
+    /**
+     * DSH 原生「按最近更新」排序会按每个 workspace 内的 session.updatedAt 排；
+     * 旧版插件或用户手动选过「手动排序」时，持久化值为 manual。这里做一次
+     * 升级迁移，切回最近更新，之后用户仍可在 DSH 里手动选择排序方式。
+     */
+    function installRecentOrder(ctx) {
+      if (typeof localStorage === 'undefined') return
+      if (localStorage.getItem(ORDER_FLAG)) return
+      let stored
+      try {
+        stored = JSON.parse(localStorage.getItem(VIEW_KEY) || 'null')
+      } catch {
+        stored = null
+      }
+      if (!stored || stored.orderBy === 'updated') {
+        localStorage.setItem(ORDER_FLAG, '1')
+        return
+      }
+      const slots = ctx.get('slots')
+      if (!slots || typeof slots.entries !== 'function') return
+      let tries = 0
+      let timer = 0
+      const tick = () => {
+        timer = 0
+        const entry = slots.entries('sidebar.workspaces').find((item) => item && item.store && typeof item.store.create === 'function')
+        if (entry) {
+          try {
+            const store = entry.store.create()
+            // store 有两种形态：直接带 actions，或要再 create 一次才拿到 actions。
+            const fallback = store && !store.actions && typeof store.create === 'function' ? store.create() : null
+            const actions = (store && store.actions) || (fallback && fallback.actions)
+            if (actions && typeof actions.setOrderBy === 'function') {
+              actions.setOrderBy('updated')
+              localStorage.setItem(ORDER_FLAG, '1')
+              return
+            }
+          } catch (error) {
+            console.warn(NAME, 'restore recent order failed', error)
+          }
+        }
+        if (++tries < 50) timer = setTimeout(tick, 200)
+      }
+      tick()
+      return () => {
+        if (timer) clearTimeout(timer)
       }
     }
 
-    return { inject, apply, _test: { buildPinnedRows, visiblePinnedRows, shouldAutoExpand, relativeTime, pruneViewedCompleted, pruneStaleTracked, terminalStateFromEntries } }
+    const inject = ['sessions', 'workspaces', 'uiWorkspace', 'uiSession', 'slots']
+
+    /** HMR 重新执行模块时先拆掉上一份挂载，避免侧栏叠出两个「置顶」区。 */
+    const CLEANUP_KEY = '__dshPinRunningCleanup__'
+
+    function apply(ctx) {
+      if (typeof window !== 'undefined') {
+        const previous = window[CLEANUP_KEY]
+        if (typeof previous === 'function') {
+          try { previous() } catch {}
+          window[CLEANUP_KEY] = undefined
+        }
+      }
+      ctx.effect(() => installRestoreGrouping(ctx), 'pin-running: restore grouping')
+      ctx.effect(() => installRecentOrder(ctx), 'pin-running: recent order')
+      if (typeof document !== 'undefined') {
+        ctx.effect(() => {
+          const cleanup = installPinnedArea(ctx)
+          if (typeof window !== 'undefined') window[CLEANUP_KEY] = cleanup
+          return () => {
+            if (typeof window !== 'undefined' && window[CLEANUP_KEY] === cleanup) window[CLEANUP_KEY] = undefined
+            cleanup()
+          }
+        }, 'pin-running: pinned section')
+      }
+    }
+
+    return { inject, apply, _test: { buildPinnedRows, visiblePinnedRows, shouldAutoExpand, relativeTime, pruneViewedCompleted, pruneStaleTracked, forgetTracked, terminalStateFromEntries, readCurrentId, repairCurrentIdStorage, markPinnedAreaActive, windowPositionFromPrefs, progressFromEntries, buildMonitorRows, monitorDetail, markTaskWindowActive, installRecentOrder } }
   },
 })
