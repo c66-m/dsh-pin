@@ -18,6 +18,96 @@ public class DshPinNative {
 '@
 [DshPinNative]::SetProcessDPIAware() | Out-Null
 
+# 点击穿透：WM_NCHITTEST 的 HTTRANSPARENT 只对同线程窗口生效，跨进程没用，
+# 所以改用 WS_EX_TRANSPARENT 动态开关：定时轮询光标，落在按钮/标题栏上就恢复正常，
+# 其余时刻整窗穿透，鼠标直接落到下面的程序。
+Add-Type -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase, System.Xaml -TypeDefinition @'
+using System;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Runtime.InteropServices;
+
+public class DshPinClickThrough {
+  const int GWL_EXSTYLE = -20;
+  const int WS_EX_TRANSPARENT = 0x00000020;
+  const int WS_EX_LAYERED = 0x00080000;
+
+  [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
+  [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int idx, int val);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
+
+  static Window _win;
+  static IntPtr _hwnd;
+  static FrameworkElement _header;
+  static bool? _last;
+
+  static void Refresh() {
+    if (_hwnd == IntPtr.Zero) return;
+    SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0, 0x0027); // SWP_NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED
+  }
+
+  [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern bool ReleaseCapture();
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+  public static void Attach(Window w, FrameworkElement header) {
+    _win = w;
+    _header = header;
+    _hwnd = new WindowInteropHelper(w).Handle;
+    Update();
+  }
+
+  /// 标准窗口拖拽：ReleaseCapture + WM_NCLBUTTONDOWN(HTCAPTION)，比 WPF DragMove 可靠。
+  public static void StartDrag() {
+    if (_hwnd == IntPtr.Zero) return;
+    int ex = GetWindowLong(_hwnd, GWL_EXSTYLE);
+    SetWindowLong(_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+    _last = false;
+    ReleaseCapture();
+    SendMessage(_hwnd, 0x00A1, (IntPtr)2, IntPtr.Zero);
+  }
+
+  /// 光标在整窗内且在标题栏或按钮/滚动条上 → 可点；否则整窗穿透。
+  public static void Update() {
+    if (_win == null || _hwnd == IntPtr.Zero) return;
+    bool interactive = false;
+    try {
+      POINT p;
+      if (GetCursorPos(out p)) {
+        var pt = _win.PointFromScreen(new Point(p.X, p.Y));
+        if (pt.X >= 0 && pt.Y >= 0 && pt.X <= _win.ActualWidth && pt.Y <= _win.ActualHeight) {
+          if (_header != null && pt.Y <= _header.ActualHeight + 4) {
+            interactive = true;   // 整条标题栏都可拖动，不穿透
+          } else {
+            var hit = _win.InputHitTest(pt) as DependencyObject;
+            int guard = 0;
+            while (hit != null && guard++ < 128) {
+              if (hit is Button || hit is ScrollBar) { interactive = true; break; }
+              hit = VisualTreeHelper.GetParent(hit);
+            }
+          }
+        }
+      }
+    } catch {}
+
+    bool wantTransparent = !interactive;
+    if (_last == wantTransparent) return;
+    _last = wantTransparent;
+
+    int ex = GetWindowLong(_hwnd, GWL_EXSTYLE);
+    int next = wantTransparent
+      ? (ex | WS_EX_TRANSPARENT | WS_EX_LAYERED)
+      : (ex & ~WS_EX_TRANSPARENT);
+    SetWindowLong(_hwnd, GWL_EXSTYLE, next);
+    Refresh();
+  }
+}
+'@
+
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -25,7 +115,7 @@ $xaml = @'
         AllowsTransparency="True" Background="Transparent"
         ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize"
         WindowStartupLocation="Manual" FontFamily="Microsoft YaHei UI">
-  <Border x:Name="Shell" CornerRadius="10" Background="#F217181C" BorderBrush="#3A3B44" BorderThickness="1">
+  <Border x:Name="Shell" CornerRadius="10" Background="#1417181C" BorderBrush="#1AFFFFFF" BorderThickness="1">
     <Grid>
       <Grid.RowDefinitions>
         <RowDefinition x:Name="HeaderRow" Height="36"/>
@@ -54,8 +144,11 @@ $xaml = @'
           <Button x:Name="PinButton" Width="24" Height="24" Margin="0,0,1,0" Background="Transparent" BorderThickness="0" Foreground="#E0A400" FontSize="12" ToolTip="取消置顶">
             <TextBlock x:Name="PinGlyph" Text="📌"/>
           </Button>
+          <Button x:Name="BackdropButton" Width="24" Height="24" Margin="0,0,1,0" BorderThickness="0" FontSize="12" ToolTip="切换背板">
+            <TextBlock x:Name="BackdropGlyph" Text="◐"/>
+          </Button>
           <Button x:Name="CloseButton" Width="24" Height="24" Background="Transparent" BorderThickness="0" Foreground="#8F9098" FontSize="14" ToolTip="关闭">
-            <TextBlock Text="×"/>
+            <TextBlock x:Name="CloseGlyph" Text="×"/>
           </Button>
         </StackPanel>
       </Grid>
@@ -70,7 +163,9 @@ $xaml = @'
 
 $window = [System.Windows.Markup.XamlReader]::Parse($xaml)
 $dragArea = $window.FindName('DragArea')
-$dragArea.Add_MouseLeftButtonDown({ param($s,$e) if ($e.ButtonState -eq 'Pressed') { try { $window.DragMove() } catch {} } }) | Out-Null
+$window.Add_MouseLeftButtonDown({ param($s,$e) if ($e.ButtonState -eq 'Pressed' -and $e.OriginalSource -ne $null -and $s -eq $window) { try { [DshPinClickThrough]::StartDrag() } catch {} } }) | Out-Null
+$dragArea.Add_MouseLeftButtonDown({ param($s,$e) if ($e.ButtonState -eq 'Pressed') { try { [DshPinClickThrough]::StartDrag() } catch {} } }) | Out-Null
+$window.FindName('Header').Add_MouseLeftButtonDown({ param($s,$e) if ($e.ButtonState -eq 'Pressed' -and $e.OriginalSource -is [System.Windows.Controls.TextBlock]) { try { [DshPinClickThrough]::StartDrag() } catch {} } }) | Out-Null
 
 $headerRow = $window.FindName('HeaderRow')
 $bodyRow = $window.FindName('BodyRow')
@@ -84,6 +179,66 @@ $expandGlyph = $window.FindName('ExpandGlyph')
 $pinButton = $window.FindName('PinButton')
 $pinGlyph = $window.FindName('PinGlyph')
 $closeButton = $window.FindName('CloseButton')
+$shell = $window.FindName('Shell')
+$backdropButton = $window.FindName('BackdropButton')
+$backdropGlyph = $window.FindName('BackdropGlyph')
+$closeGlyph = $window.FindName('CloseGlyph')
+
+$script:glyphPaths = @{}
+$script:glyphTypeface = New-Object System.Windows.Media.Typeface('Microsoft YaHei UI')
+
+# 文字没有 Stroke，转 Path 几何再分层画：黑描边层在下、彩色填充层在上，
+# 硬边 1px，不会像高斯阴影那样糊成泛光。
+function Set-GlyphText([string]$key, [string]$text) {
+  $g = $script:glyphPaths[$key]
+  if (-not $g) { return }
+  $g.Text = $text
+  $ft = New-Object System.Windows.Media.FormattedText($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, $script:glyphTypeface, $g.Size, [System.Windows.Media.Brushes]::Black, 1.0)
+  $geo = $ft.BuildGeometry([System.Windows.Point]::new(0,0))
+  $g.StrokePath.Data = $geo
+  $g.FillPath.Data = $geo
+}
+
+function Set-GlyphFill([string]$key, [string]$color) {
+  $g = $script:glyphPaths[$key]
+  if ($g) { $g.FillPath.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString($color) }
+}
+
+function Set-GlyphStroke([string]$key, [string]$color) {
+  $g = $script:glyphPaths[$key]
+  if ($g) {
+    $brush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($color)
+    $g.StrokePath.Stroke = $brush
+    $g.StrokePath.Fill = $brush
+  }
+}
+
+function Add-GlyphPath([System.Windows.Controls.TextBlock]$tb, [string]$key) {
+  $btn = $tb.Parent
+  if (-not ($btn -is [System.Windows.Controls.Button])) { return }
+  $grid = New-Object System.Windows.Controls.Grid
+  $strokePath = New-Object System.Windows.Shapes.Path
+  $strokePath.StrokeThickness = 0.8
+  $strokePath.StrokeLineJoin = 'Round'
+  $strokePath.Fill = [System.Windows.Media.Brushes]::Black
+  $strokePath.Stroke = [System.Windows.Media.Brushes]::Black
+  $strokePath.HorizontalAlignment = 'Center'
+  $strokePath.VerticalAlignment = 'Center'
+  $fillPath = New-Object System.Windows.Shapes.Path
+  $fillPath.Fill = $tb.Foreground
+  $fillPath.HorizontalAlignment = 'Center'
+  $fillPath.VerticalAlignment = 'Center'
+  $grid.Children.Add($strokePath) | Out-Null
+  $grid.Children.Add($fillPath) | Out-Null
+  $script:glyphPaths[$key] = @{ StrokePath = $strokePath; FillPath = $fillPath; Size = ($tb.FontSize + 4); Text = $tb.Text }
+  Set-GlyphText $key $tb.Text
+  $btn.Content = $grid
+}
+
+Add-GlyphPath $expandGlyph 'expand'
+Add-GlyphPath $pinGlyph 'pin'
+Add-GlyphPath $backdropGlyph 'backdrop'
+Add-GlyphPath $closeGlyph 'close'
 
 $script:expanded = $true
 $script:anchorRight = 0
@@ -98,14 +253,14 @@ function Set-Expanded([bool]$value) {
     $bodyScroll.Visibility = 'Visible'
     $window.Width = 320
     $window.Height = 150
-    $expandGlyph.Text = '－'
+    Set-GlyphText 'expand' '－'
   } else {
     $headerRow.Height = [System.Windows.GridLength]::new(36)
     $bodyRow.Height = [System.Windows.GridLength]::new(0)
     $bodyScroll.Visibility = 'Collapsed'
     $window.Width = 260
     $window.Height = 38
-    $expandGlyph.Text = '＋'
+    Set-GlyphText 'expand' '＋'
   }
   $window.Left = $script:anchorRight - $window.Width
 }
@@ -247,11 +402,55 @@ function Update-Tasks {
   }
 }
 
+$script:transparent = $true
+
+# 透明模式：面板几乎看不见，所以标题栏按钮自己带一块黑底，否则按钮图标在桌面上找不着。
+function Set-Backdrop([bool]$transparent) {
+  $script:transparent = $transparent
+  if ($transparent) {
+    $shell.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#1417181C')
+    $shell.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#1AFFFFFF')
+    foreach ($b in @($expandButton, $pinButton, $backdropButton, $closeButton)) {
+      $b.Background = [System.Windows.Media.Brushes]::Transparent
+      $b.BorderThickness = [System.Windows.Thickness]::new(0)
+      $b.FocusVisualStyle = $null
+    }
+    Set-GlyphFill 'expand' '#FFFFFF'
+    Set-GlyphFill 'pin' '#F0B400'
+    Set-GlyphFill 'backdrop' '#FFFFFF'
+    Set-GlyphFill 'close' '#FFFFFF'
+    Set-GlyphStroke 'expand' '#000000'
+    Set-GlyphStroke 'pin' '#000000'
+    Set-GlyphStroke 'backdrop' '#000000'
+    Set-GlyphStroke 'close' '#000000'
+    Set-GlyphText 'backdrop' '◐'
+    $backdropButton.ToolTip = '切换为实心背板'
+  } else {
+    $shell.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#F217181C')
+    $shell.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#3A3B44')
+    foreach ($b in @($expandButton, $pinButton, $backdropButton, $closeButton)) {
+      $b.Background = [System.Windows.Media.Brushes]::Transparent
+      $b.BorderThickness = [System.Windows.Thickness]::new(0)
+    }
+    Set-GlyphFill 'expand' '#8F9098'
+    Set-GlyphFill 'pin' '#E0A400'
+    Set-GlyphFill 'backdrop' '#8F9098'
+    Set-GlyphFill 'close' '#8F9098'
+    Set-GlyphStroke 'expand' '#00000000'
+    Set-GlyphStroke 'pin' '#00000000'
+    Set-GlyphStroke 'backdrop' '#00000000'
+    Set-GlyphStroke 'close' '#00000000'
+    Set-GlyphText 'backdrop' '◑'
+    $backdropButton.ToolTip = '切换为透明背板'
+  }
+}
+
+$backdropButton.Add_Click({ Set-Backdrop (-not $script:transparent) }) | Out-Null
 $expandButton.Add_Click({ Set-Expanded (-not $script:expanded) }) | Out-Null
 $pinButton.Add_Click({
   $window.Topmost = -not $window.Topmost
   $pinColor = if ($window.Topmost) { '#E0A400' } else { '#8F9098' }
-  $pinGlyph.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString($pinColor)
+  Set-GlyphFill 'pin' $pinColor
 }) | Out-Null
 $closeButton.Add_Click({ $window.Close() }) | Out-Null
 
@@ -260,6 +459,7 @@ $script:anchorRight = $screen.Right - 16
 $window.Left = $script:anchorRight - 320
 $window.Top = $screen.Top + 16
 Set-Expanded $true
+Set-Backdrop $true
 
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(900)
@@ -267,4 +467,17 @@ $timer.Add_Tick({ Update-Tasks })
 $timer.Start()
 
 Update-Tasks
+
+# 句柄一就绪就装穿透开关：标题栏 + 按钮 / 滚动条可点，其余整窗穿透。
+$window.Add_SourceInitialized({
+  try { [DshPinClickThrough]::Attach($window, $window.FindName('Header')) } catch { }
+}) | Out-Null
+
+# 40ms 轮询光标位置，切换 WS_EX_TRANSPARENT；比 WM_NCHITTEST 可靠（跨进程有效）。
+$passTimer = New-Object System.Windows.Threading.DispatcherTimer
+$passTimer.Interval = [TimeSpan]::FromMilliseconds(25)
+$passTimer.Add_Tick({ try { [DshPinClickThrough]::Update() } catch { } })
+$window.Add_Loaded({ $passTimer.Start() }) | Out-Null
+$window.Add_Closed({ $passTimer.Stop() }) | Out-Null
+
 [void]$window.ShowDialog()
